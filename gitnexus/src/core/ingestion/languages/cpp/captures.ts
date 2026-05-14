@@ -720,12 +720,14 @@ function isParenthesizedFunctionCall(callNode: SyntaxNode): boolean {
 
 /**
  * Per-argument ADL classification: walk each argument of a free call and
- * decide whether it resolves to a directly-named class or class-pointer
- * type (ADL fires) or to an excluded shape such as a reference, function
- * pointer, primitive, literal, or template specialization.
+ * classify its declared type for associated-namespace lookup.
  *
- * Class-typed values and class pointers (`N::S`, `N::S*`, `N::S**`) all
- * preserve the pointee class name for associated-namespace lookup.
+ * Value/pointer/reference class-typed args and template specializations
+ * with explicit type arguments contribute; function pointers, primitives,
+ * literals, and other unsupported shapes produce an empty result.
+ *
+ * Class-typed values/pointers/references (`N::S`, `N::S*`, `N::S&`) all
+ * preserve the class name for associated-namespace lookup.
  * Function pointers remain excluded even when their return type names a
  * class, because the associated entity is the pointed-to function type,
  * not the return type.
@@ -746,8 +748,6 @@ function inferCppCallAdlArgs(callNode: SyntaxNode): CppAdlArgInfo[] {
 const ADL_TEMPLATE_RECURSION_MAX_DEPTH = 8;
 const EMPTY_ADL_ARG: CppAdlArgInfo = {
   simpleClassName: '',
-  isPointer: false,
-  isReference: false,
   templateSimpleClassName: '',
   templateNamespace: '',
   templateArgClassNames: [],
@@ -808,8 +808,6 @@ function lookupAdlIdentifierType(identNode: SyntaxNode): CppAdlArgInfo {
     // `init_declarator > identifier` is value.
     // Function-pointer wrappers (`pointer_declarator > function_declarator`)
     // must not contribute ADL associated namespaces.
-    let isPointer = false;
-    let isReference = false;
     let isFunctionPointer = false;
     let inner: SyntaxNode = declarator;
     let nameText: string | null = null;
@@ -820,14 +818,12 @@ function lookupAdlIdentifierType(identNode: SyntaxNode): CppAdlArgInfo {
           isFunctionPointer = true;
           break;
         }
-        isPointer = true;
         const next = inner.childForFieldName('declarator');
         if (next === null) break;
         inner = next;
         continue;
       }
       if (inner.type === 'reference_declarator' || inner.type === 'rvalue_reference_declarator') {
-        isReference = true;
         // reference_declarator has a single child (the inner declarator).
         let next: SyntaxNode | null = null;
         for (let j = 0; j < inner.namedChildCount; j++) {
@@ -866,8 +862,6 @@ function lookupAdlIdentifierType(identNode: SyntaxNode): CppAdlArgInfo {
     } = extractAdlTemplateInfo(typeNode);
     return {
       simpleClassName,
-      isPointer,
-      isReference,
       templateSimpleClassName,
       templateNamespace,
       templateArgClassNames,

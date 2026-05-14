@@ -69,11 +69,6 @@ export interface CppAdlArgInfo {
   /** Simple class-like type name (last segment of qualified name); empty
    *  for primitives, literals, function pointers, etc. */
   readonly simpleClassName: string;
-  /** True when the variable's declarator contained one or more
-   *  `pointer_declarator` wrappers. */
-  readonly isPointer: boolean;
-  /** True when the variable's declarator was a `reference_declarator`. */
-  readonly isReference: boolean;
   /** Template's own simple class-like name (e.g. `vector` for
    *  `std::vector<N::T>`), empty when arg type is not a template spec. */
   readonly templateSimpleClassName: string;
