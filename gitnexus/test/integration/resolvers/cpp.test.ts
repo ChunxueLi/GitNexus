@@ -2248,6 +2248,19 @@ describe('C++ ADL — template specialization args contribute associated namespa
     expect(applyCalls.length).toBe(1);
     expect(applyCalls[0].targetFilePath).toContain('audit.h');
   });
+
+  it('applyArray(a) where a is std::array<N::T, 4> resolves to N::applyArray (non-type arg ignored)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const applyCalls = calls.filter((c) => c.source === 'runArray' && c.target === 'applyArray');
+    expect(applyCalls.length).toBe(1);
+    expect(applyCalls[0].targetFilePath).toContain('audit.h');
+  });
+
+  it('applyStdConflict(v) is suppressed when ADL surfaces both N and std candidates', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const applyCalls = calls.filter((c) => c.source === 'runStdConflict' && c.target === 'applyStdConflict');
+    expect(applyCalls.length).toBe(0);
+  });
 });
 
 describe('C++ ADL — int/long-collision overloads suppress via OVERLOAD_AMBIGUOUS', () => {

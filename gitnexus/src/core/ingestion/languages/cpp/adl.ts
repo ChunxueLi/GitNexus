@@ -188,6 +188,9 @@ export function pickCppAdlCandidates(
     if (arg.isReference) continue;
 
     if (arg.simpleClassName !== '') {
+      // For template args this may be the template name itself (e.g.
+      // `vector`); simple-name lookup can match project classes with the
+      // same name (known V1/V2 simplification).
       const classDef = findCppClassDefBySimpleName(arg.simpleClassName, scopes);
       if (classDef !== undefined) {
         const nsQName = classToNamespaceQualifiedName.get(classDef.nodeId);
@@ -195,6 +198,9 @@ export function pickCppAdlCandidates(
       }
     }
 
+    // Includes template-owner namespaces (e.g. `std` in std::vector<T>).
+    // If that surfaces extra candidates, ADL_AMBIGUOUS suppression below
+    // prevents arbitrary edge emission.
     if (arg.templateNamespace.length > 0) associatedNamespaces.add(arg.templateNamespace);
 
     for (const ns of arg.templateArgNamespaces) {
