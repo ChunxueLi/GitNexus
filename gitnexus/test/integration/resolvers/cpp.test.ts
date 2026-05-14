@@ -2175,7 +2175,16 @@ describe('C++ ADL — reference arg unwrapping', () => {
     const calls = getRelationships(result, 'CALLS');
     const recordCalls = calls.filter((c) => c.source === 'runRef' && c.target === 'record');
     expect(recordCalls.length).toBe(1);
-    expect(recordCalls[0].targetFilePath).toContain('audit.h');
+    expect(recordCalls[0].targetFilePath).toContain('record.h');
+  });
+
+  it('recordConst(cs) where cs is const audit::Event& resolves via ADL', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const recordCalls = calls.filter(
+      (c) => c.source === 'runConstRef' && c.target === 'recordConst',
+    );
+    expect(recordCalls.length).toBe(1);
+    expect(recordCalls[0].targetFilePath).toContain('record.h');
   });
 
   it('note(r) where r is int& emits zero CALLS edges (primitive ref)', () => {

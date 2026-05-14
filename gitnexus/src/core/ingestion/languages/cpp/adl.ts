@@ -72,8 +72,6 @@ export interface CppAdlArgInfo {
   /** True when the variable's declarator contained one or more
    *  `pointer_declarator` wrappers. */
   readonly isPointer: boolean;
-  /** True when the variable's declarator was a `reference_declarator`. */
-  readonly isReference: boolean;
 }
 
 const argInfoBySite = new Map<string, readonly CppAdlArgInfo[]>();
