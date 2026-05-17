@@ -88,6 +88,12 @@ function formatTimeoutDuration(timeoutMs: number): string {
   return `${timeoutMs}ms`;
 }
 
+function isTimeoutLikeError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
+  return /timed?\s*out|abort/i.test(err.message);
+}
+
 /**
  * Validate that a base URL supplied for LLM API calls is a safe HTTP/HTTPS
  * endpoint (CWE-918 / CodeQL js/http-to-file-access).
@@ -269,11 +275,7 @@ export async function callLLM(
         `LLM API error (${err.response.status} after retries): ${errorText.slice(0, 500)}`,
       );
     }
-    if (
-      config.requestTimeoutMs !== undefined &&
-      err instanceof DOMException &&
-      (err.name === 'TimeoutError' || err.name === 'AbortError')
-    ) {
+    if (config.requestTimeoutMs !== undefined && isTimeoutLikeError(err)) {
       throw new Error(
         `LLM request timed out after ${formatTimeoutDuration(config.requestTimeoutMs)}. ` +
           'Increase --timeout or omit it to disable the per-attempt timeout.',
