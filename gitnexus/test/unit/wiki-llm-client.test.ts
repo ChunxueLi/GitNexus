@@ -310,7 +310,7 @@ describe('callLLM — timeout handling', () => {
         requestTimeoutMs: 120_000,
       }),
     ).rejects.toThrow(
-      'LLM request timed out after 120s. Increase --timeout or omit it to disable the per-attempt timeout.',
+      'LLM request timed out after 120s. Increase --timeout or omit it to disable the request timeout.',
     );
   });
 
@@ -331,7 +331,7 @@ describe('callLLM — timeout handling', () => {
         requestTimeoutMs: 1_500,
       }),
     ).rejects.toThrow(
-      'LLM request timed out after 1500ms. Increase --timeout or omit it to disable the per-attempt timeout.',
+      'LLM request timed out after 1500ms. Increase --timeout or omit it to disable the request timeout.',
     );
   });
 
@@ -352,8 +352,25 @@ describe('callLLM — timeout handling', () => {
         requestTimeoutMs: 120_000,
       }),
     ).rejects.toThrow(
-      'LLM request timed out after 120s. Increase --timeout or omit it to disable the per-attempt timeout.',
+      'LLM request timed out after 120s. Increase --timeout or omit it to disable the request timeout.',
     );
+  });
+
+  it('does not mislabel generic aborted connections as request timeouts', async () => {
+    const fetchSpy = vi.fn().mockRejectedValue(new Error('connection aborted by server'));
+    vi.stubGlobal('fetch', fetchSpy);
+
+    const { callLLM } = await import('../../src/core/wiki/llm-client.js');
+    await expect(
+      callLLM('test', {
+        apiKey: 'sk-test',
+        baseUrl: 'https://api.openai.com/v1',
+        model: 'gpt-4o',
+        maxTokens: 500,
+        temperature: 0,
+        requestTimeoutMs: 120_000,
+      }),
+    ).rejects.toThrow('connection aborted by server');
   });
 });
 

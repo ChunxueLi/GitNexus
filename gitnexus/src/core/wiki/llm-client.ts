@@ -91,7 +91,7 @@ function formatTimeoutDuration(timeoutMs: number): string {
 function isTimeoutLikeError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   if (err.name === 'TimeoutError' || err.name === 'AbortError') return true;
-  return /time(d)?\s*out|timeout|abort/i.test(err.message);
+  return /time(d)?\s*out|timeout/i.test(err.message);
 }
 
 /**
@@ -250,7 +250,7 @@ export async function callLLM(
           ...authHeaders,
         },
         body: JSON.stringify(body),
-        // Per-attempt timeout is opt-in for wiki generation. Large local
+        // Request timeout is opt-in for wiki generation. Large local
         // model runs can legitimately take well over a minute, so the
         // default runtime path must not impose a hidden 60s ceiling.
         signal:
@@ -278,7 +278,7 @@ export async function callLLM(
     if (config.requestTimeoutMs !== undefined && isTimeoutLikeError(err)) {
       throw new Error(
         `LLM request timed out after ${formatTimeoutDuration(config.requestTimeoutMs)}. ` +
-          'Increase --timeout or omit it to disable the per-attempt timeout.',
+          'Increase --timeout or omit it to disable the request timeout.',
       );
     }
     throw err;

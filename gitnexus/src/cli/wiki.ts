@@ -145,8 +145,10 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   }
 
   let timeoutSeconds: number | undefined;
+  let retries: number | undefined;
   try {
     timeoutSeconds = parsePositiveIntegerOption(options?.timeout, '--timeout', 1000);
+    retries = parsePositiveIntegerOption(options?.retries, '--retries');
   } catch (error) {
     console.log(`  Error: ${(error as Error).message}\n`);
     process.exitCode = 1;
@@ -379,9 +381,8 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   if (timeoutSeconds !== undefined) {
     llmConfig.requestTimeoutMs = timeoutSeconds * 1000;
   }
-  if (options?.retries) {
-    const n = parseInt(options.retries, 10);
-    if (!isNaN(n) && n > 0) llmConfig.maxAttempts = n;
+  if (retries !== undefined) {
+    llmConfig.maxAttempts = retries;
   }
 
   // ── Setup progress bar with elapsed timer ──────────────────────────
