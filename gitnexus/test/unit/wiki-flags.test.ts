@@ -282,7 +282,7 @@ describe('wikiCommand --timeout validation', () => {
     process.exitCode = originalExitCode;
   });
 
-  it.each(['0', '-1', 'abc'])(
+  it.each(['', '   ', '0', '-1', 'abc'])(
     'rejects invalid --timeout value %s before starting generation',
     async (timeout) => {
       const generatorCtor = vi.fn().mockImplementation(() => ({
