@@ -88,18 +88,18 @@ const childProcessLikelyOom = (err: unknown): boolean => {
   const statusSignalLikelyOom = e.status === 134 || e.signal === 'SIGABRT';
   if (statusSignalLikelyOom) return true;
 
-  const text = [e.message, e.stderr, e.stdout]
-    .map((v) => (Buffer.isBuffer(v) ? v.toString('utf8') : typeof v === 'string' ? v : ''))
-    .join('\n')
-    .toLowerCase();
+  const hasHeapOomSignature = (v: unknown): boolean => {
+    const text = (Buffer.isBuffer(v) ? v.toString('utf8') : typeof v === 'string' ? v : '').toLowerCase();
+    if (!text) return false;
+    return (
+      text.includes('javascript heap out of memory') ||
+      text.includes('reached heap limit') ||
+      text.includes('allocation failed - javascript heap out of memory') ||
+      text.includes('fatalprocessoutofmemory')
+    );
+  };
 
-  const textLikelyOom =
-    text.includes('javascript heap out of memory') ||
-    text.includes('reached heap limit') ||
-    text.includes('allocation failed') ||
-    text.includes('fatalprocessoutofmemory');
-
-  return textLikelyOom;
+  return hasHeapOomSignature(e.message) || hasHeapOomSignature(e.stderr) || hasHeapOomSignature(e.stdout);
 };
 
 /** Re-exec the process with a 16GB heap and larger stack if we're currently below that. */
