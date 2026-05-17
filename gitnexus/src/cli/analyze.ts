@@ -76,15 +76,29 @@ const STACK_FLAG = `--stack-size=${STACK_KB}`;
 /**
  * Heuristic for "child re-exec likely died from V8 OOM".
  *
- * `execFileSync(..., { stdio: 'inherit' })` does not give us structured
- * OOM metadata, but on Linux/macOS Node commonly exits with status 134
- * and/or SIGABRT after a fatal heap exhaustion. We use those signatures
- * to decide when to print heap-increase guidance for the user.
+ * Platform-independent detection is best-effort: V8/Node usually emit
+ * stable heap-exhaustion phrases in stderr/message across Linux/macOS/Windows
+ * (for example "JavaScript heap out of memory" or "Reached heap limit"),
+ * while some environments only expose status/signal (e.g. 134/SIGABRT).
+ * We combine both text signatures and process-exit signatures.
  */
 const childProcessLikelyOom = (err: unknown): boolean => {
   if (!err || typeof err !== 'object') return false;
-  const e = err as { status?: unknown; signal?: unknown };
-  return e.status === 134 || e.signal === 'SIGABRT';
+  const e = err as { status?: unknown; signal?: unknown; stderr?: unknown; stdout?: unknown; message?: unknown };
+  const statusSignalLikelyOom = e.status === 134 || e.signal === 'SIGABRT';
+
+  const text = [e.message, e.stderr, e.stdout]
+    .map((v) => (Buffer.isBuffer(v) ? v.toString('utf8') : typeof v === 'string' ? v : ''))
+    .join('\n')
+    .toLowerCase();
+
+  const textLikelyOom =
+    text.includes('javascript heap out of memory') ||
+    text.includes('reached heap limit') ||
+    text.includes('allocation failed') ||
+    text.includes('fatalprocessoutofmemory');
+
+  return statusSignalLikelyOom || textLikelyOom;
 };
 
 /** Re-exec the process with a 16GB heap and larger stack if we're currently below that. */

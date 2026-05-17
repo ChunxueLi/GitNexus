@@ -63,4 +63,29 @@ describe('analyzeCommand heap respawn', () => {
     );
     cap.restore();
   });
+
+  it('prints heap guidance when child stderr contains heap OOM signature', async () => {
+    delete process.env.NODE_OPTIONS;
+    getHeapStatisticsMock.mockReturnValue({ heap_size_limit: 512 * 1024 * 1024 });
+    execFileSyncMock.mockImplementationOnce(() => {
+      const err = new Error('Command failed') as Error & {
+        status?: number;
+        signal?: string;
+        stderr?: Buffer;
+      };
+      err.status = 1;
+      err.signal = undefined;
+      err.stderr = Buffer.from('FATAL ERROR: Reached heap limit Allocation failed - JavaScript heap out of memory');
+      throw err;
+    });
+
+    const { _captureLogger } = await import('../../src/core/logger.js');
+    const cap = _captureLogger();
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+    await analyzeCommand(undefined, {});
+
+    expect(process.exitCode).toBe(1);
+    expect(cap.records().some((r) => r.msg.includes('Analysis likely ran out of memory.'))).toBe(true);
+    cap.restore();
+  });
 });
