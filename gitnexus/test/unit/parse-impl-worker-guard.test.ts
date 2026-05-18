@@ -29,9 +29,10 @@ describe('hasWorkerUnsafeLanguages', () => {
     expect(hasWorkerUnsafeLanguages([{ path: 'include/api.h', size: 100 }])).toBe(true);
   });
 
-  it('returns true when C++ header files (.hpp, .hxx) are present', () => {
+  it('returns true when C++ header files (.hpp, .hxx, .hh) are present', () => {
     expect(hasWorkerUnsafeLanguages([{ path: 'include/api.hpp', size: 100 }])).toBe(true);
     expect(hasWorkerUnsafeLanguages([{ path: 'include/core.hxx', size: 100 }])).toBe(true);
+    expect(hasWorkerUnsafeLanguages([{ path: 'include/util.hh', size: 100 }])).toBe(true);
   });
 
   it('returns false for an empty list', () => {
