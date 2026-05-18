@@ -71,7 +71,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDev } from '../utils/env.js';
 import { synthesizeWildcardImportBindings, needsSynthesis } from './wildcard-synthesis.js';
 import { extractORMQueriesInline } from './orm-extraction.js';
-import { hasWorkerUnsafeLanguageMix } from '../workers/worker-language-guard.js';
+import { hasWorkerUnsafeLanguages } from '../workers/worker-language-guard.js';
 
 import { logger } from '../../logger.js';
 // ── Constants ──────────────────────────────────────────────────────────────
@@ -222,10 +222,10 @@ export async function runChunkedParseAndResolve(
   const MIN_BYTES_FOR_WORKERS = options?.workerThresholdsForTest?.minBytes ?? 512 * 1024;
   const totalBytes = parseableScanned.reduce((s, f) => s + f.size, 0);
   const disableWorkersForNativeLanguages =
-    process.env.GITNEXUS_ALLOW_CPP_WORKERS !== '1' && hasWorkerUnsafeLanguageMix(parseableScanned);
+    process.env.GITNEXUS_ALLOW_CPP_WORKERS !== '1' && hasWorkerUnsafeLanguages(parseableScanned);
   if (disableWorkersForNativeLanguages) {
     logger.warn(
-      'C/C++ files detected — using sequential parser path to avoid known worker-thread native binding errors (e.g. `Napi::Error`). Set GITNEXUS_ALLOW_CPP_WORKERS=1 to force workers.',
+      'C/C++ files detected — using sequential parser path to avoid known worker-thread native binding errors (e.g. `Napi::Error`). If you use a custom tree-sitter build that resolves this issue, set GITNEXUS_ALLOW_CPP_WORKERS=1 to force workers.',
     );
   }
 
