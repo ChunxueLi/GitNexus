@@ -379,11 +379,11 @@ export async function runChunkedParseAndResolve(
         // sequential path to avoid the crash. Other chunks (no C/C++) keep
         // using the worker pool. GITNEXUS_ALLOW_CPP_WORKERS=1 opts out of
         // this guard when a stable custom build is in use.
-        const chunkHasCppFiles =
+        const chunkHasWorkerUnsafeFiles =
           workerPool &&
           process.env.GITNEXUS_ALLOW_CPP_WORKERS !== '1' &&
           hasWorkerUnsafeLanguages(chunkFiles);
-        if (chunkHasCppFiles && !hasWarnedAboutCppChunks) {
+        if (chunkHasWorkerUnsafeFiles && !hasWarnedAboutCppChunks) {
           hasWarnedAboutCppChunks = true;
           logger.warn(
             'C/C++ files detected — parsing those chunks in sequential mode to avoid known ' +
@@ -417,7 +417,7 @@ export async function runChunkedParseAndResolve(
           // unrecoverable Napi::Error crashes from native grammar bindings in
           // worker threads. processParsing falls through to processParsingSequential
           // (main-thread safe). All other chunks keep using the worker pool.
-          chunkHasCppFiles ? undefined : workerPool,
+          chunkHasWorkerUnsafeFiles ? undefined : workerPool,
           // Capture raw results only when we have a cache to write to —
           // otherwise we'd retain extra arrays for nothing.
           parseCache && chunkHash ? rawResults : undefined,
