@@ -81,6 +81,7 @@ type ReceiverBoundProviderSubset = Pick<
   | 'resolveThisViaEnclosingClass'
   | 'conversionRankFn'
   | 'constraintCompatibility'
+  | 'isStaticOnly'
 >;
 
 function normalizeTemplateArgToken(value: string): string {
@@ -673,6 +674,15 @@ export function emitReceiverBoundCalls(
             // Suppress and mark handled so `emitReferencesViaLookup`
             // doesn't re-emit the pre-resolved reference. See
             // OVERLOAD_AMBIGUOUS docstring for the upstream cause.
+            handledSites.add(siteKey);
+            continue;
+          }
+          // Static-only filter (Kotlin companion methods, future
+          // `@staticmethod` / `static` semantics). Case 4 dispatches
+          // through an INSTANCE receiver, where invoking a class-bound
+          // member is invalid. Suppress the edge AND mark handled so
+          // `emitReferencesViaLookup` doesn't re-emit a wrong target.
+          if (memberDef !== undefined && provider.isStaticOnly?.(memberDef) === true) {
             handledSites.add(siteKey);
             continue;
           }

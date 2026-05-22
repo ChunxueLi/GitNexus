@@ -1,6 +1,23 @@
 import type { ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import { isClassLike, populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
 
+/** Non-enumerable property name carrying the "this method can only be
+ *  dispatched through the class name" marker for companion-promoted
+ *  Kotlin methods. Set by `populateCompanionMembersOnEnclosingClass`;
+ *  consumed by `isKotlinStaticOnly` (the `ScopeResolver.isStaticOnly`
+ *  hook). Treated as an internal side-channel — keep it off the shared
+ *  `SymbolDefinition` interface to avoid contaminating other languages'
+ *  type. */
+const KOTLIN_STATIC_MARKER = '__kotlinCompanionStatic';
+
+interface KotlinStaticMarked {
+  readonly [KOTLIN_STATIC_MARKER]?: boolean;
+}
+
+export function isKotlinStaticOnly(def: SymbolDefinition): boolean {
+  return (def as KotlinStaticMarked)[KOTLIN_STATIC_MARKER] === true;
+}
+
 export function populateKotlinOwners(parsed: ParsedFile): void {
   populateClassOwnedMembers(parsed);
   populateCompanionMembersOnEnclosingClass(parsed);
@@ -44,6 +61,14 @@ function populateCompanionMembersOnEnclosingClass(parsed: ParsedFile): void {
     for (const def of scope.ownedDefs) {
       if (def.ownerId !== undefined) continue;
       (def as { ownerId?: string }).ownerId = enclosing.nodeId;
+      // Mark as static-only so `ScopeResolver.isStaticOnly` (see
+      // `isKotlinStaticOnly`) can filter these out of instance-receiver
+      // dispatch (#1756). Promoting the companion method onto the
+      // outer class lets `Foo.companionMethod()` resolve via Case 2;
+      // without this marker, `fooInstance.companionMethod()` would
+      // ALSO resolve to it via Case 4, which is incorrect (and a
+      // compile error in real Kotlin).
+      (def as { [KOTLIN_STATIC_MARKER]?: boolean })[KOTLIN_STATIC_MARKER] = true;
       qualify(def, enclosing);
     }
   }

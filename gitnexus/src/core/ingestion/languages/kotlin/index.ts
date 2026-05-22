@@ -4,7 +4,7 @@ export { interpretKotlinImport, interpretKotlinTypeBinding } from './interpret.j
 export { kotlinArityCompatibility } from './arity.js';
 export { resolveKotlinImportTarget, type KotlinResolveContext } from './import-target.js';
 export { kotlinMergeBindings } from './merge-bindings.js';
-export { populateKotlinOwners } from './owners.js';
+export { isKotlinStaticOnly, populateKotlinOwners } from './owners.js';
 export {
   kotlinBindingScopeFor,
   kotlinImportOwningScope,

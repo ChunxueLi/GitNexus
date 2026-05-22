@@ -3,6 +3,8 @@
  */
 import path from 'path';
 import { it as vitestIt } from 'vitest';
+import { SupportedLanguages } from 'gitnexus-shared';
+import { MIGRATED_LANGUAGES } from '../../../src/core/ingestion/registry-primary-flag.js';
 import { runPipelineFromRepo } from '../../../src/core/ingestion/pipeline.js';
 import type { PipelineOptions } from '../../../src/core/ingestion/pipeline.js';
 import type { PipelineResult } from '../../../src/types/pipeline.js';
@@ -123,6 +125,19 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     'picks the lexicographically smaller path on equal-depth ties',
     'binds the call to alpha/services/sync.py, not omega',
     'lex tiebreak still picks alpha/services/sync.py with reversed file-write order',
+  ]),
+  kotlin: new Set<string>([
+    // #1756 companion-vs-instance dispatch: the registry-primary path
+    // suppresses `instance.companionMethod()` via `ScopeResolver.
+    // isStaticOnly` (see `isKotlinStaticOnly` + the Case 4 filter in
+    // `receiver-bound-calls.ts`). The legacy DAG has no equivalent
+    // static-only gate — companion methods promoted onto the outer
+    // class are also returned by `lookupMethodByOwner` when the
+    // receiver is an instance, producing a false `CALLS` edge. Scope-
+    // resolver-only correctness win; backporting to legacy is out of
+    // scope per the migration policy (the bug stops mattering once
+    // Kotlin enters `MIGRATED_LANGUAGES` and legacy stops running).
+    'crossover() invoking logger.create() on an instance emits NO CALLS edge',
   ]),
   cpp: new Set<string>([
     // The legacy DAG path has no scope-aware filtering on the global
@@ -290,7 +305,34 @@ export function isLegacyResolverParityRun(
   env: ResolverParityEnv = process.env,
 ): boolean {
   const value = env[resolverParityFlagName(languageSlug)]?.trim().toLowerCase();
-  return value === '0' || value === 'false' || value === 'no';
+  if (value === '0' || value === 'false' || value === 'no') return true;
+  // For languages not yet in `MIGRATED_LANGUAGES`, the default-mode test
+  // run is itself a legacy-DAG run (production resolution stays on the
+  // legacy path until the migration flip). Treat an UNSET env var as
+  // legacy parity for those languages so the expected-failures gate
+  // skips scope-resolver-only correctness wins in regular CI without
+  // requiring an explicit `REGISTRY_PRIMARY_<LANG>=0` from every job.
+  // Languages already in `MIGRATED_LANGUAGES` keep their previous
+  // semantics (unset → registry-primary default, the failures list is
+  // ignored unless explicitly opted into legacy via env).
+  if (value === undefined && !isMigratedLanguage(languageSlug)) return true;
+  return false;
+}
+
+function isMigratedLanguage(languageSlug: string): boolean {
+  const normalized = languageSlug.toLowerCase();
+  for (const lang of MIGRATED_LANGUAGES) {
+    if (lang.toLowerCase() === normalized) return true;
+    // SupportedLanguages enum values are kebab/lowercase already, but
+    // the slug arg can be either the enum value (e.g. `cpp`) or its
+    // SupportedLanguages key (e.g. `CPlusPlus`). Compare both to stay
+    // robust against call-site convention drift.
+    const keyMatch = (
+      Object.keys(SupportedLanguages) as Array<keyof typeof SupportedLanguages>
+    ).find((k) => SupportedLanguages[k] === lang);
+    if (keyMatch !== undefined && keyMatch.toLowerCase() === normalized) return true;
+  }
+  return false;
 }
 
 export function isLegacyResolverParityExpectedFailure(

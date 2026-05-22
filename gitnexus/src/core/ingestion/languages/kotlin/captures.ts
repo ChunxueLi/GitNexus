@@ -393,15 +393,21 @@ function collectKotlinClassMembers(rootNode: SyntaxNode): KotlinClassMembers {
           const ftype = v?.namedChildren.find((c) => isKotlinTypeNode(c))?.text;
           if (fname !== undefined && ftype !== undefined) fmap.set(fname, ftype);
         } else if (member.type === 'function_declaration') {
-          const mname = member.namedChildren.find((c) => c.type === 'simple_identifier')?.text;
-          const paramsIdx = member.namedChildren.findIndex(
-            (c) => c.type === 'function_value_parameters',
-          );
-          const rtype =
-            paramsIdx < 0
-              ? undefined
-              : member.namedChildren.slice(paramsIdx + 1).find((c) => isKotlinTypeNode(c))?.text;
-          if (mname !== undefined && rtype !== undefined) mmap.set(mname, rtype);
+          collectKotlinFunctionReturn(member, mmap);
+        } else if (member.type === 'companion_object') {
+          // Companion-object methods (`companion object { fun create() … }`)
+          // are addressable via the outer class name (`Logger.create()`).
+          // Register them on the outer class so chain-binding for
+          // `val x = Logger.create(...)` picks up the return type (#1756).
+          // The receiver-side filtering needed to prevent
+          // `instance.companionMethod()` crossover is handled elsewhere.
+          const compBody = member.namedChildren.find((c) => c.type === 'class_body');
+          if (compBody !== undefined) {
+            for (const compMember of compBody.namedChildren) {
+              if (compMember.type !== 'function_declaration') continue;
+              collectKotlinFunctionReturn(compMember, mmap);
+            }
+          }
         }
       }
     }
@@ -410,6 +416,16 @@ function collectKotlinClassMembers(rootNode: SyntaxNode): KotlinClassMembers {
     methods.set(className, mmap);
   }
   return { fields, methods };
+}
+
+function collectKotlinFunctionReturn(fnNode: SyntaxNode, target: Map<string, string>): void {
+  const mname = fnNode.namedChildren.find((c) => c.type === 'simple_identifier')?.text;
+  const paramsIdx = fnNode.namedChildren.findIndex((c) => c.type === 'function_value_parameters');
+  const rtype =
+    paramsIdx < 0
+      ? undefined
+      : fnNode.namedChildren.slice(paramsIdx + 1).find((c) => isKotlinTypeNode(c))?.text;
+  if (mname !== undefined && rtype !== undefined) target.set(mname, rtype);
 }
 
 function collectKotlinLocalTypeTexts(
@@ -520,9 +536,19 @@ function inferKotlinNavigationFieldType(
   return classMembers.fields.get(normalizeKotlinType(recvType))?.get(member) ?? null;
 }
 
-/** Resolve `receiver.method()` → method's declared return type, where
- *  `receiver` is a simple identifier whose type is in `localTypes` and
- *  `method` is declared on that type in `classMembers.methods`. */
+/** Resolve `receiver.method()` → method's declared return type. The
+ *  `receiver` is a simple identifier; we try two interpretations in
+ *  order:
+ *
+ *    1. `receiver` is a local variable whose type is in `localTypes` —
+ *       look up `method` on that type's class members.
+ *    2. `receiver` is itself a class name (e.g. `Logger.create("app")`,
+ *       a companion-object call via the class) — look up `method` on
+ *       `classMembers.methods.get(receiver.text)` directly.
+ *
+ *  Tier 2 supports `val logger = Logger.create(...)` patterns where the
+ *  RHS is a companion-object factory: the loop variable's type is the
+ *  factory's return type (#1756). */
 function inferKotlinNavigationCallReturnType(
   navCallee: SyntaxNode,
   localTypes: ReadonlyMap<string, string>,
@@ -536,8 +562,10 @@ function inferKotlinNavigationCallReturnType(
     ?.namedChildren.find((c) => c.type === 'simple_identifier')?.text;
   if (methodName === undefined) return null;
   const recvType = localTypes.get(receiver.text);
-  if (recvType === undefined) return null;
-  return classMembers.methods.get(normalizeKotlinType(recvType))?.get(methodName) ?? null;
+  if (recvType !== undefined) {
+    return classMembers.methods.get(normalizeKotlinType(recvType))?.get(methodName) ?? null;
+  }
+  return classMembers.methods.get(receiver.text)?.get(methodName) ?? null;
 }
 
 function inferKotlinIterableElementType(

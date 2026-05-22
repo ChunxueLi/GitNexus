@@ -2063,3 +2063,64 @@ describe('Kotlin User implements Validator — interface default method (SM-11)'
     expect(validateCall!.source).toBe('run');
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1756: companion-object members must dispatch through the class name,
+// never through an instance receiver.
+//
+// `Logger.create(...)` — companion call via the class name — resolves to the
+// companion's `create`. `logger.log(...)` and `logger.create(...)` — calls
+// through an INSTANCE — must resolve to the instance method and NOT cross
+// over to the companion-only `create`.
+// ---------------------------------------------------------------------------
+
+describe('Kotlin companion vs instance member dispatch (#1756)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'kotlin-companion-vs-instance'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Logger class with companion-only create() and instance log()', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Logger');
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('create');
+    expect(methods).toContain('log');
+  });
+
+  it('Logger.create("app") resolves to the companion create', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const createCall = calls.find((c) => c.source === 'makeLogger' && c.target === 'create');
+    expect(createCall).toBeDefined();
+    expect(createCall!.targetFilePath).toBe('App.kt');
+  });
+
+  it('logger.log("hello") resolves to the instance log, NOT companion create', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const logCall = calls.find((c) => c.source === 'makeLogger' && c.target === 'log');
+    expect(logCall).toBeDefined();
+    expect(logCall!.targetFilePath).toBe('App.kt');
+  });
+
+  it('logger.log() in directLog() resolves to the instance log', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const logCall = calls.find((c) => c.source === 'directLog' && c.target === 'log');
+    expect(logCall).toBeDefined();
+  });
+
+  it('crossover() invoking logger.create() on an instance emits NO CALLS edge', () => {
+    // `logger.create(...)` on an instance is a compile error in Kotlin —
+    // companion-object methods can only be called through the class name.
+    // The resolver must NOT emit a CALLS edge for this call site (#1756).
+    // Registry-primary path filters via `ScopeResolver.isStaticOnly`; the
+    // legacy DAG has a pre-existing crossover bug, so this assertion is
+    // marked as a legacy expected failure in
+    // `LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES.kotlin` (helpers.ts).
+    const calls = getRelationships(result, 'CALLS');
+    const crossover = calls.find((c) => c.source === 'crossover' && c.target === 'create');
+    expect(crossover).toBeUndefined();
+  });
+});

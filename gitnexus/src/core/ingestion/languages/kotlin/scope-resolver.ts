@@ -7,6 +7,7 @@ import type { GraphNodeLookup } from '../../scope-resolution/graph-bridge/node-l
 import { isClassLike } from '../../scope-resolution/scope/walkers.js';
 import { kotlinProvider } from '../kotlin.js';
 import {
+  isKotlinStaticOnly,
   kotlinArityCompatibility,
   kotlinMergeBindings,
   populateKotlinOwners,
@@ -51,6 +52,8 @@ export const kotlinScopeResolver: ScopeResolver = {
   populateOwners: (parsed: ParsedFile) => populateKotlinOwners(parsed),
 
   isSuperReceiver: (text) => text.trim() === 'super',
+
+  isStaticOnly: isKotlinStaticOnly,
 
   fieldFallbackOnMethodLookup: false,
   propagatesReturnTypesAcrossImports: true,

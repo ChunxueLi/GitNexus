@@ -588,6 +588,26 @@ export interface ScopeResolver {
   readonly isFileLocalDef?: (def: SymbolDefinition) => boolean;
 
   /**
+   * Optional predicate to identify members that can only be dispatched
+   * through a class-name receiver, never through an instance receiver
+   * (Kotlin companion-object methods, Java/C# `static` methods, Python
+   * `@staticmethod`-decorated methods). When provided, the receiver-
+   * bound calls pass filters out static-only members at Case 4
+   * (instance-receiver dispatch) so `instance.companionMethod()` —
+   * which is a compile error in Kotlin and a code smell in others —
+   * does not emit a misleading `CALLS` edge.
+   *
+   * Case 2 (class-name receiver) is intentionally unaffected: a call
+   * through the class name (`Foo.staticMethod()`) is a legitimate
+   * dispatch and the static-only filter would suppress it.
+   *
+   * Languages without static-only semantics leave this undefined and
+   * the legacy unfiltered behavior applies (every owned member of the
+   * receiver class is a dispatch candidate).
+   */
+  readonly isStaticOnly?: (def: SymbolDefinition) => boolean;
+
+  /**
    * Optional predicate to gate free-call fallback emission by caller-side
    * visibility. When provided, `pickUniqueGlobalCallable` rejects candidates
    * the caller cannot legally reach — e.g., a PHP function in a different
