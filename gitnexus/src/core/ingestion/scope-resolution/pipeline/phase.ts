@@ -31,7 +31,7 @@ import type { PipelinePhase, PipelineContext, PhaseResult } from '../../pipeline
 import { getPhaseOutput } from '../../pipeline-phases/types.js';
 import type { StructureOutput } from '../../pipeline-phases/structure.js';
 import type { ParseOutput } from '../../pipeline-phases/parse.js';
-import { isRegistryPrimary } from '../../registry-primary-flag.js';
+import { isRegistryPrimaryExecutionEnabled } from '../../registry-primary-flag.js';
 import { SupportedLanguages, getLanguageFromFilename } from 'gitnexus-shared';
 import { readFileContents } from '../../filesystem-walker.js';
 import { runScopeResolution } from './run.js';
@@ -126,11 +126,7 @@ export const scopeResolutionPhase: PipelinePhase<ScopeResolutionOutput> = {
     >();
 
     for (const [lang, provider] of SCOPE_RESOLVERS) {
-      if (!isRegistryPrimary(lang)) continue;
-      // Kotlin remains registry-primary for CI auto-discovery, but the
-      // runtime scope-resolution execution stays disabled until parity with
-      // the legacy DAG reaches 100% for the full fixture set.
-      if (lang === SupportedLanguages.Kotlin) continue;
+      if (!isRegistryPrimaryExecutionEnabled(lang)) continue;
 
       const langFiles = scannedFiles.filter((f) => getLanguageFromFilename(f.path) === lang);
       if (langFiles.length === 0) continue;

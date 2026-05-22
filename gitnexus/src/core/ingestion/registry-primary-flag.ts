@@ -81,6 +81,14 @@ export const MIGRATED_LANGUAGES: ReadonlySet<SupportedLanguages> = new Set<Suppo
 ]);
 
 /**
+ * Languages that stay on the legacy import/call/cross-file runtime path
+ * even when registry-primary is enabled, while parity hardening continues.
+ */
+const LEGACY_PARITY_FALLBACK_LANGUAGES: ReadonlySet<SupportedLanguages> = new Set([
+  SupportedLanguages.Kotlin,
+]);
+
+/**
  * Return the env-var name that controls a given language's registry-
  * primary flag. Exported for test assertions and for the PR-labeling
  * CI job that cross-references per-language flag changes.
@@ -101,6 +109,14 @@ export function isRegistryPrimary(lang: SupportedLanguages): boolean {
   const raw = process.env[envVarNameFor(lang)];
   if (raw !== undefined) return parseFlag(raw);
   return MIGRATED_LANGUAGES.has(lang);
+}
+
+/**
+ * Whether runtime should execute the scope-resolution registry-primary
+ * pipeline for `lang` (as opposed to legacy fallback execution).
+ */
+export function isRegistryPrimaryExecutionEnabled(lang: SupportedLanguages): boolean {
+  return isRegistryPrimary(lang) && !LEGACY_PARITY_FALLBACK_LANGUAGES.has(lang);
 }
 
 /**

@@ -5,7 +5,7 @@ import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/pa
 import { getProvider, getProviderForFile, providersWithImplicitWiring } from './languages/index.js';
 import type { LanguageProvider } from './language-provider.js';
 import { generateId } from '../../lib/utils.js';
-import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
+import { getLanguageFromFilename } from 'gitnexus-shared';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import { parseSourceSafe } from '../tree-sitter/safe-parse.js';
@@ -26,7 +26,7 @@ import type {
 import type { NamedBinding } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
 import { isDev } from './utils/env.js';
-import { isRegistryPrimary } from './registry-primary-flag.js';
+import { isRegistryPrimaryExecutionEnabled } from './registry-primary-flag.js';
 
 import { logger } from '../logger.js';
 // Type: Map<FilePath, Set<ResolvedFilePath>>
@@ -109,12 +109,7 @@ function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
 
   const addImportGraphEdge = (filePath: string, resolvedPath: string) => {
     const language = getLanguageFromFilename(filePath);
-    if (
-      language !== null &&
-      isRegistryPrimary(language) &&
-      language !== SupportedLanguages.Kotlin
-    )
-      return;
+    if (language !== null && isRegistryPrimaryExecutionEnabled(language)) return;
     const sourceId = generateId('File', filePath);
     const targetId = generateId('File', resolvedPath);
     const relId = generateId('IMPORTS', `${filePath}->${resolvedPath}`);

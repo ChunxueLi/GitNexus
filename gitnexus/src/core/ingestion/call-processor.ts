@@ -37,7 +37,7 @@ import { isLanguageAvailable, loadParser, loadLanguage } from '../tree-sitter/pa
 import { getProvider } from './languages/index.js';
 import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
-import { isRegistryPrimary } from './registry-primary-flag.js';
+import { isRegistryPrimaryExecutionEnabled } from './registry-primary-flag.js';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
 import { parseSourceSafe } from '../tree-sitter/safe-parse.js';
@@ -822,7 +822,7 @@ export const processCalls = async (
     const language = getLanguageFromFilename(file.path);
     if (!language) continue;
     // Registry-primary gate: scope-based phase owns CALLS for this lang.
-    if (isRegistryPrimary(language) && language !== SupportedLanguages.Kotlin) continue;
+    if (isRegistryPrimaryExecutionEnabled(language)) continue;
     if (!isLanguageAvailable(language)) {
       if (skippedByLang) {
         skippedByLang.set(language, (skippedByLang.get(language) ?? 0) + 1);
@@ -2920,12 +2920,7 @@ export const processCallsFromExtracted = async (
     // Registry-primary gate: skip Python (etc.) entirely when the
     // scope-based phase owns CALLS for this language.
     const fileLanguage = getLanguageFromFilename(filePath);
-    if (
-      fileLanguage &&
-      isRegistryPrimary(fileLanguage) &&
-      fileLanguage !== SupportedLanguages.Kotlin
-    )
-      continue;
+    if (fileLanguage && isRegistryPrimaryExecutionEnabled(fileLanguage)) continue;
 
     ctx.enableCache(filePath);
     const widenCache: WidenCache = new Map();
