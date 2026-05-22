@@ -22,6 +22,25 @@ const KOTLIN_SCOPE_QUERY = `
   (check_expression)
   (control_structure_body) @scope.block)
 
+;; Lambda body scope (issue #1757). Each lambda_literal becomes its
+;; own Block scope so synthesized lambda-parameter and implicit-'it'
+;; type-bindings (see captures.ts synthesizeKotlinLambdaBindings) stay
+;; inside the lambda — they must not leak to the enclosing function
+;; scope and must shadow same-named outer bindings (val it = "outer";
+;; users.forEach { it.save() } — inner 'it' is the lambda's, not the
+;; outer String).
+;;
+;; Lambdas appear inside call_suffix for trailing-lambda syntax
+;; (list.forEach { it.foo() }) and inside value_arguments for
+;; explicit-paren syntax (list.forEach({ x -> x.foo() })); both AST
+;; positions produce the same lambda_literal subtree, so a single
+;; capture suffices.
+;;
+;; Uses @scope.block (not @scope.function) to match the smart-cast
+;; precedent (#1758) — keeps narrowed/lambda bindings scope-local
+;; without the auto-hoist semantics of Function scopes.
+(lambda_literal) @scope.block
+
 ;; Declarations — types
 (class_declaration
   "interface"

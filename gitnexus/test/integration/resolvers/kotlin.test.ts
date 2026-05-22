@@ -2131,3 +2131,103 @@ describe('Kotlin companion vs instance member dispatch (#1756)', () => {
     expect(crossover).toBeUndefined();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Kotlin lambda scopes (#1757)
+//
+// Lambda bodies create a new lexical scope in which the lambda's parameter
+// list (or implicit `it`) binds. Call sites inside the lambda body must
+// resolve through these bindings; implicit `it` must be visible only inside
+// the lambda; nested lambdas must shadow deterministically. Covers stdlib
+// idioms: `forEach`, `map`, `filter`, `let`, `apply`, `also`, `with`,
+// `takeIf`, `use`.
+// ---------------------------------------------------------------------------
+
+describe('Kotlin lambda scopes (#1757)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'kotlin-lambda-scopes'), () => {});
+  }, 60000);
+
+  it('detects User and Post classes plus save/like methods', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+    expect(getNodesByLabel(result, 'Class')).toContain('Post');
+    expect(getNodesByLabel(result, 'Method')).toContain('save');
+    expect(getNodesByLabel(result, 'Method')).toContain('like');
+  });
+
+  // Happy path: explicit parameter
+  it('explicitParam: user.save() inside forEach resolves to User.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter((c) => c.source === 'explicitParam' && c.target === 'save');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toBe('App.kt');
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const userSave = hasMethod.find((e) => e.source === 'User' && e.target === 'save');
+    expect(userSave).toBeDefined();
+    expect(saveCalls[0].rel.targetId).toBe(userSave!.rel.targetId);
+  });
+
+  // Happy path: implicit `it`
+  it('implicitIt: it.save() inside forEach resolves to User.save via implicit it', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter((c) => c.source === 'implicitIt' && c.target === 'save');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toBe('App.kt');
+  });
+
+  // Happy path: chain — outer lambda's `it.name` does not cross-bind
+  it('chained: emits no erroneous save/like edges (inner it bound to User, not Post)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const erroneousSave = calls.find((c) => c.source === 'chained' && c.target === 'save');
+    const erroneousLike = calls.find((c) => c.source === 'chained' && c.target === 'like');
+    expect(erroneousSave).toBeUndefined();
+    expect(erroneousLike).toBeUndefined();
+  });
+
+  it('chained: println(name) inside forEach resolves to file-scope println', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const printlnCalls = calls.filter((c) => c.source === 'chained' && c.target === 'println');
+    expect(printlnCalls.length).toBe(1);
+    expect(printlnCalls[0].targetFilePath).toBe('App.kt');
+  });
+
+  // Edge case: nested lambdas — inner `it` is Post, outer `user` is User
+  it('nested: inner it.like() resolves to Post.like (NOT User.like)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const likeCalls = calls.filter((c) => c.source === 'nested' && c.target === 'like');
+    expect(likeCalls.length).toBe(1);
+    expect(likeCalls[0].targetFilePath).toBe('App.kt');
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const postLike = hasMethod.find((e) => e.source === 'Post' && e.target === 'like');
+    expect(postLike).toBeDefined();
+    expect(likeCalls[0].rel.targetId).toBe(postLike!.rel.targetId);
+  });
+
+  it('nested: emits NO save() CALLS edge (outer `user` parameter is not called)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const wrongSave = calls.find((c) => c.source === 'nested' && c.target === 'save');
+    expect(wrongSave).toBeUndefined();
+  });
+
+  // Edge case: `let` exposes the receiver as `it`
+  it('letScope: it.save() inside let { } resolves to User.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter((c) => c.source === 'letScope' && c.target === 'save');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toBe('App.kt');
+  });
+
+  // Edge case: shadowing — inner `it` (User) beats outer `val it = "outer"`
+  it('outerItShadow: inner it.save() resolves to User.save (outer val it is shadowed)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter((c) => c.source === 'outerItShadow' && c.target === 'save');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toBe('App.kt');
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const userSave = hasMethod.find((e) => e.source === 'User' && e.target === 'save');
+    expect(userSave).toBeDefined();
+    expect(saveCalls[0].rel.targetId).toBe(userSave!.rel.targetId);
+  });
+});

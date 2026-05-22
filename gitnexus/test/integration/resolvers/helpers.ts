@@ -136,6 +136,24 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     // scope per the migration policy (the bug stops mattering once
     // Kotlin enters `MIGRATED_LANGUAGES` and legacy stops running).
     'crossover() invoking logger.create() on an instance emits NO CALLS edge',
+    // #1757 lambda scopes: the registry-primary path creates a Block
+    // scope per `lambda_literal` and synthesizes scoped type-bindings
+    // for the lambda parameter / implicit `it` (see
+    // `synthesizeKotlinLambdaBindings` in `kotlin/captures.ts` plus
+    // the `@type-binding.lambda-scoped` gate in
+    // `kotlinBindingScopeFor`). This lets the body's call-resolution
+    // chain see the chain-typebinding for the lambda's enclosing
+    // call (`users.map { it.name }.forEach { name -> println(name) }`)
+    // and emit the `chained -> println` edge correctly. The legacy DAG
+    // has no lambda-body scope and no per-lambda type-binding
+    // synthesis; calls inside lambdas resolve against the enclosing
+    // function scope only, so the `name` parameter chain inside a
+    // chained-receiver forEach lambda doesn't carry the right binding
+    // and the call-extractor never emits the CALLS edge. Scope-
+    // resolver-only correctness win; backporting requires re-modeling
+    // lambda bodies as their own scopes in `call-processor.ts`, which
+    // is out of scope per migration policy.
+    'chained: println(name) inside forEach resolves to file-scope println',
   ]),
   cpp: new Set<string>([
     // The legacy DAG path has no scope-aware filtering on the global
