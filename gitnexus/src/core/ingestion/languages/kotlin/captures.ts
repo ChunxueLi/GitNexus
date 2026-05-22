@@ -1,4 +1,4 @@
-import type { Capture, CaptureMatch, Range } from 'gitnexus-shared';
+import { makeScopeId, type Capture, type CaptureMatch, type Range } from 'gitnexus-shared';
 import {
   findNodeAtRange,
   nodeToCapture,
@@ -13,12 +13,13 @@ import { recordKotlinCacheHit, recordKotlinCacheMiss } from './cache-stats.js';
 import { normalizeKotlinType } from './interpret.js';
 import { synthesizeKotlinReceiverBinding } from './receiver-binding.js';
 import { getKotlinParser, getKotlinScopeQuery } from './query.js';
+import { markCompanionScope } from './companion-scopes.js';
 
 const FUNCTION_DECL_TAGS = ['@declaration.function'] as const;
 
 export function emitKotlinScopeCaptures(
   sourceText: string,
-  _filePath: string,
+  filePath: string,
   cachedTree?: unknown,
 ): readonly CaptureMatch[] {
   let tree = cachedTree as ReturnType<ReturnType<typeof getKotlinParser>['parse']> | undefined;
@@ -45,6 +46,27 @@ export function emitKotlinScopeCaptures(
       grouped[tag] = nodeToCapture(tag, capture.node);
     }
     if (Object.keys(grouped).length === 0) continue;
+
+    // Companion-object marker (#1756 / U4). The `@scope.companion`
+    // capture is a side-channel marker — it shares its range with the
+    // existing `(companion_object) @scope.class` rule, so the Class
+    // scope already exists in the scope tree. Record the scope id into
+    // the per-file companion-scope set so `populateCompanionMembersOn
+    // EnclosingClass` (owners.ts) can identify companion scopes
+    // unambiguously, regardless of whether they are anonymous, named,
+    // or contain nested classes. The match itself is consumed here and
+    // NOT pushed to the output — the scope-extractor would reject the
+    // `companion` kind suffix anyway, but suppressing the emit keeps
+    // downstream pipelines from re-processing the same range twice.
+    if (grouped['@scope.companion'] !== undefined) {
+      const scopeId = makeScopeId({
+        filePath,
+        range: grouped['@scope.companion']!.range,
+        kind: 'Class',
+      });
+      markCompanionScope(filePath, scopeId);
+      continue;
+    }
 
     if (grouped['@import.statement'] !== undefined) {
       const importNode = findNodeAtRange(

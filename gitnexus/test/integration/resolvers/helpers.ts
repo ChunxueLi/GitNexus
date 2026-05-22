@@ -169,6 +169,19 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     // lambda bodies as their own scopes in `call-processor.ts`, which
     // is out of scope per migration policy.
     'chained: println(name) inside forEach resolves to file-scope println',
+    // #1756 / U4 (remediation plan 2026-05-22-002) named-companion
+    // crossover: the registry-primary path stamps the static-only
+    // marker on named-companion methods (via the new `@scope.companion`
+    // marker capture and the updated `populateCompanionMembersOn
+    // EnclosingClass` guard), so `instance.namedCompanionMethod()`
+    // is filtered out at the `isStaticOnly` hook. The legacy DAG has
+    // no static-only gate AND no named-companion-aware owner
+    // promotion — it both leaves the named-companion method owned
+    // by `Helper` AND emits a crossover edge when the call site uses
+    // an instance receiver. Same scope-resolver-only correctness
+    // class as the bare `crossover()` test; backporting is out of
+    // scope per the migration policy.
+    'useNamedCrossover: o.create() emits NO CALLS edge to create',
   ]),
   cpp: new Set<string>([
     // The legacy DAG path has no scope-aware filtering on the global

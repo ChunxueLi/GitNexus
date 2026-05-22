@@ -1,5 +1,6 @@
 import type { ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import { isClassLike, populateClassOwnedMembers } from '../../scope-resolution/scope/walkers.js';
+import { isCompanionScope } from './companion-scopes.js';
 
 /** Property name carrying the "this method can only be dispatched
  *  through the class name" marker for companion-promoted Kotlin
@@ -59,12 +60,38 @@ function populateCompanionMembersOnEnclosingClass(parsed: ParsedFile): void {
     if (scope.kind !== 'Function' || scope.parent === null) continue;
     const parent = scopesById.get(scope.parent);
     if (parent === undefined || parent.kind !== 'Class') continue;
-    if (parent.ownedDefs.some((def) => isClassLike(def.type))) continue;
+    // Identify companion-object scopes via the `@scope.companion` marker
+    // capture (see captures.ts / companion-scopes.ts) rather than via
+    // the old `parent.ownedDefs.some(isClassLike)` heuristic. The
+    // heuristic silently bypassed two real shapes (#1756 / U4):
+    //   - named companions (`companion object Helper { ... }`) — `Helper`
+    //     registered as a class-like def on the companion scope; AND
+    //   - companions containing nested classes (`companion object {
+    //     class Token; fun create() }`) — the nested class lived on
+    //     the companion scope.
+    // Both bypasses left companion methods unpromoted and unmarked,
+    // breaking class-name dispatch (`Outer.create()`) and crossover
+    // suppression (`outer.create()`) for those shapes. The marker
+    // capture lifts the distinction to the parser layer where any
+    // `companion_object` AST node is a companion, full stop.
+    if (!isCompanionScope(parsed.filePath, parent.id)) continue;
 
     const enclosing = findEnclosingClassWithDef(parent.parent, scopesById);
     if (enclosing === undefined) continue;
     for (const def of scope.ownedDefs) {
-      if (def.ownerId !== undefined) continue;
+      // Class-like defs nested inside the companion's methods (rare —
+      // would be a local class declared inside a fun-body) are not
+      // companion members and must not be promoted. The companion's
+      // direct nested classes live in their OWN scope's ownedDefs
+      // (NOT the function-scope ownedDefs we iterate here), so this
+      // guard is defense-in-depth.
+      if (isClassLike(def.type)) continue;
+      // OVERRIDE rather than skip-when-set: for named companions,
+      // `populateClassOwnedMembers` already set `ownerId = Helper`
+      // (the named-companion class-like def). That is the WRONG
+      // owner — companion methods are dispatched through the
+      // enclosing outer class, not through the companion's own
+      // type name. Overwriting restores the intended ownership.
       (def as { ownerId?: string }).ownerId = enclosing.nodeId;
       // Mark as static-only so `ScopeResolver.isStaticOnly` (see
       // `isKotlinStaticOnly`) can filter these out of instance-receiver
@@ -97,7 +124,16 @@ function findEnclosingClassWithDef(
 }
 
 function qualify(def: SymbolDefinition, owner: SymbolDefinition): void {
-  if (def.qualifiedName === undefined || def.qualifiedName.includes('.')) return;
+  if (def.qualifiedName === undefined) return;
   if (owner.qualifiedName === undefined || owner.qualifiedName.length === 0) return;
-  (def as { qualifiedName: string }).qualifiedName = `${owner.qualifiedName}.${def.qualifiedName}`;
+  // For named companions, `populateClassOwnedMembers` qualified the
+  // def as `Helper.create`. Strip the companion-class prefix and
+  // re-qualify with the outer class so the graph-bridge lookup keys
+  // resolve to `Outer.create` rather than the spurious `Helper.create`.
+  // For unqualified defs (the anonymous-companion path), the simple
+  // name is unchanged — `populateClassOwnedMembers` found no class-like
+  // def in the anonymous companion scope, so the prior pass left the
+  // simple name in place.
+  const simple = def.qualifiedName.split('.').pop() ?? def.qualifiedName;
+  (def as { qualifiedName: string }).qualifiedName = `${owner.qualifiedName}.${simple}`;
 }

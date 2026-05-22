@@ -2320,3 +2320,83 @@ describe('Kotlin companion vs instance MRO shadowing (#1756 / U2)', () => {
     expect(fromUseStandalone.length).toBe(0);
   });
 });
+
+// ---------------------------------------------------------------------------
+// #1756 / U4 remediation: named companions and companions containing nested
+// classes must promote their methods onto the enclosing class AND stamp the
+// static-only marker (so crossover via instance receiver is suppressed).
+//
+// Pre-U4 `populateCompanionMembersOnEnclosingClass` used the heuristic
+// `parent.ownedDefs.some(isClassLike) → continue`, which silently bypassed:
+//   - named companions (`companion object Helper { ... }`) — `Helper`
+//     looked like a class-like def on the companion scope; and
+//   - companions containing nested classes (`companion object { class
+//     Token; fun create() }`) — the nested class def lived on the
+//     companion scope.
+// U4 replaces the heuristic with a parser-layer marker capture
+// (`@scope.companion`), so any `companion_object` AST node is
+// unambiguously identified as a companion regardless of contents.
+// ---------------------------------------------------------------------------
+
+describe('Kotlin named companion + nested-class companions (#1756 / U4)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'kotlin-companion-named'), () => {});
+  }, 60000);
+
+  it('detects Outer / WithNested / InnerClassAndCompanion classes and create / forge / build methods', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Outer');
+    expect(classes).toContain('WithNested');
+    expect(classes).toContain('InnerClassAndCompanion');
+    const methods = getNodesByLabel(result, 'Method');
+    expect(methods).toContain('create');
+    expect(methods).toContain('forge');
+    expect(methods).toContain('build');
+  });
+
+  // Happy path (named companion): Outer.create() resolves through the
+  // enclosing class name. Pre-U4 this emitted zero edges because the
+  // named-companion `create` was owned by `Helper`, not `Outer`.
+  it('useNamed: Outer.create() resolves to exactly 1 CALLS edge → create', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCalls = calls.filter((c) => c.source === 'useNamed' && c.target === 'create');
+    expect(saveCalls.length).toBe(1);
+    expect(saveCalls[0].targetFilePath).toBe('App.kt');
+  });
+
+  // Crossover suppression (named): the instance-receiver `o.create()` is a
+  // compile error in Kotlin — companion methods are not legal instance-
+  // dispatch candidates. Pre-U4 this emitted a false edge because the
+  // static-only marker was never stamped on the named-companion `create`.
+  it('useNamedCrossover: o.create() emits NO CALLS edge to create', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const crossover = calls.filter(
+      (c) => c.source === 'useNamedCrossover' && c.target === 'create',
+    );
+    expect(crossover.length).toBe(0);
+  });
+
+  // Happy path (companion containing a nested class): WithNested.forge()
+  // resolves through the enclosing class name. Pre-U4 the nested
+  // `class Token` made the companion look like a regular class to the
+  // heuristic, so `forge` was never promoted onto `WithNested`.
+  it('useNested: WithNested.forge() resolves to exactly 1 CALLS edge → forge', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const forgeCalls = calls.filter((c) => c.source === 'useNested' && c.target === 'forge');
+    expect(forgeCalls.length).toBe(1);
+    expect(forgeCalls[0].targetFilePath).toBe('App.kt');
+  });
+
+  // Mix (inner-class + companion): the class-name call resolves to the
+  // promoted companion method; the instance-receiver crossover emits
+  // nothing. Verifies that the U4 fix does NOT misclassify a regular
+  // class with a sibling companion as a companion itself.
+  it('useInnerMix: exactly 1 CALLS edge to build (class-name call resolves; crossover suppressed)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const buildCalls = calls.filter((c) => c.source === 'useInnerMix' && c.target === 'build');
+    expect(buildCalls.length).toBe(1);
+    expect(buildCalls[0].targetFilePath).toBe('App.kt');
+  });
+});

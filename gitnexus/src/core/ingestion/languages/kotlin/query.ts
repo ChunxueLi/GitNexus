@@ -9,6 +9,20 @@ const KOTLIN_SCOPE_QUERY = `
 (companion_object) @scope.class
 (function_declaration) @scope.function
 
+;; Companion-object marker (issue #1756 / U4). Side-channel capture that
+;; lets populateCompanionMembersOnEnclosingClass distinguish a companion
+;; Class scope from a regular Class scope without inspecting ownedDefs.
+;; Anonymous companions AND companions containing nested classes both
+;; look like regular classes through the old ownedDefs-based heuristic;
+;; the marker lifts the distinction up to the parser layer where it is
+;; unambiguous (any companion_object AST node is a companion, full
+;; stop). Consumed by markCompanionScope / isCompanionScope in
+;; captures.ts / companion-scopes.ts. The scope-extractor ignores the
+;; "companion" suffix (no ScopeKind mapping), so this rule contributes
+;; no Scope record of its own — the existing (companion_object)
+;; @scope.class rule still creates the Class scope.
+(companion_object) @scope.companion
+
 ;; Smart-cast narrowing scopes (RFC #909 Ring 3, issue #1758).
 ;; Each is-test arm body and each if-then body becomes its own Block
 ;; scope so synthesized narrowed type-bindings (see captures.ts
