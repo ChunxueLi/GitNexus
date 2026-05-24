@@ -55,7 +55,7 @@ export function lookupBindingsAt(
 ): readonly BindingRef[] {
   const finalized = scopes.bindings.get(scopeId)?.get(name);
   const augmented = scopes.bindingAugmentations.get(scopeId)?.get(name);
-  const workspace = scopes.workspaceFqnBindings.get(name);
+  const workspace = scopes.workspaceFqnBindings?.get(name);
   const fLen = finalized?.length ?? 0;
   const aLen = augmented?.length ?? 0;
   const wLen = workspace?.length ?? 0;

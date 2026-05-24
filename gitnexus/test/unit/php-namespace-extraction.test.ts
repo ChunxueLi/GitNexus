@@ -94,4 +94,41 @@ describe('extractNamespaceViaScanner', () => {
     const src = `<?php declare(strict_types=1); namespace App\\Inline;`;
     expect(extractNamespaceViaScanner(src)).toBe('App\\Inline');
   });
+
+  it('ignores namespace inside mid-line block comment', () => {
+    const src = [
+      '<?php /*',
+      'namespace Fake\\Comment;',
+      '*/',
+      'namespace App\\Real;',
+    ].join('\n');
+    expect(extractNamespaceViaScanner(src)).toBe('App\\Real');
+  });
+
+  it('handles single-line block comment before namespace on same line', () => {
+    const src = `<?php /* comment */ namespace App\\After;`;
+    expect(extractNamespaceViaScanner(src)).toBe('App\\After');
+  });
+
+  it('handles PHP 7.3 flexible heredoc with indented closing delimiter', () => {
+    const src = [
+      '<?php',
+      '$code = <<<EOT',
+      '    namespace Fake\\Vendor;',
+      '    EOT;',
+      'namespace App\\Real;',
+    ].join('\n');
+    expect(extractNamespaceViaScanner(src)).toBe('App\\Real');
+  });
+
+  it('handles nowdoc with indented closing delimiter', () => {
+    const src = [
+      '<?php',
+      "$code = <<<'EOT'",
+      '    namespace Fake\\Vendor;',
+      '  EOT;',
+      'namespace App\\Real;',
+    ].join('\n');
+    expect(extractNamespaceViaScanner(src)).toBe('App\\Real');
+  });
 });

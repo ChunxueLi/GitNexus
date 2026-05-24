@@ -56,7 +56,8 @@ export function extractNamespaceViaScanner(content: string): string {
 
   for (const raw of lines) {
     if (heredocDelimiter !== null) {
-      if (raw.trimEnd() === heredocDelimiter + ';' || raw.trimEnd() === heredocDelimiter) {
+      const trimmed = raw.trim();
+      if (trimmed === heredocDelimiter + ';' || trimmed === heredocDelimiter) {
         heredocDelimiter = null;
       }
       continue;
@@ -69,14 +70,19 @@ export function extractNamespaceViaScanner(content: string): string {
       continue;
     }
 
-    if (raw.trimStart().startsWith('/*')) {
-      if (!raw.includes('*/')) {
+    let line = raw;
+
+    const blockStart = line.indexOf('/*');
+    if (blockStart >= 0) {
+      const blockEnd = line.indexOf('*/', blockStart + 2);
+      if (blockEnd >= 0) {
+        line = line.slice(0, blockStart) + line.slice(blockEnd + 2);
+      } else {
+        line = line.slice(0, blockStart);
         inBlockComment = true;
       }
-      continue;
     }
 
-    let line = raw;
     const slashIdx = line.indexOf('//');
     const hashIdx = line.indexOf('#');
     if (slashIdx >= 0 && (hashIdx < 0 || slashIdx < hashIdx)) {
