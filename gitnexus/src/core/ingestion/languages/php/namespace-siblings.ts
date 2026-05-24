@@ -305,35 +305,28 @@ export function populatePhpNamespaceSiblings(
     }
   }
 
-  // Step 3b: Inject fully-qualified-name bindings into every PHP file's
-  // Module scope. PHP `\App\Models\User` (leading-backslash FQN) and
-  // `App\Models\User` (already-qualified relative) on a parameter or
-  // typed receiver must resolve to the exact namespace-qualified class
-  // regardless of which simple-name `User` the caller's `use` imports
-  // shadowed. The shared `findClassBindingInScope` scope-chain walk
-  // consumes these augmentations via `lookupBindingsAt`, so adding the
-  // qualified key on every file's module scope routes FQN-receivers to
-  // the right def. Codex PR #1497 review, finding 1.
+  // Step 3b: Register FQN bindings in a workspace-level map instead of
+  // per-scope augmentations. PHP `\App\Models\User` and `App\Models\User`
+  // must resolve regardless of which file the lookup originates from.
+  // `lookupBindingsAt` consults `workspaceFqnBindings` as a third source.
   //
-  // Cost: O(PHP files × class-like defs in the workspace) augmentation
-  // entries. Bounded and acceptable in practice — typical PHP projects
-  // have hundreds of files and classes, not tens of thousands.
-  for (const parsed of parsedFiles) {
-    const moduleScope = parsed.scopes.find((s) => s.kind === 'Module');
-    if (moduleScope === undefined) continue;
-    const moduleScopeId = moduleScope.id;
-
-    for (const [ns, bucket] of buckets) {
-      if (ns === '') continue; // global-namespace classes have no qualified form to register
-      for (const def of bucket.classDefs) {
-        const q = def.qualifiedName ?? '';
-        const simpleName = q.includes('\\') ? q.slice(q.lastIndexOf('\\') + 1) : q;
-        if (simpleName === '') continue;
-        const fqn = `${ns}\\${simpleName}`;
-        const arr = getAugmentationBucket(augmentations, moduleScopeId, fqn);
-        if (arr.some((b) => b.def.nodeId === def.nodeId)) continue;
-        arr.push({ def, origin: 'namespace' });
+  // Cost: O(class-like defs) entries — NOT O(files × classDefs). For 16K
+  // PHP files with 5K classes, this is 5K entries instead of 80M.
+  const fqnMap = indexes.workspaceFqnBindings as Map<string, BindingRef[]>;
+  for (const [ns, bucket] of buckets) {
+    if (ns === '') continue;
+    for (const def of bucket.classDefs) {
+      const q = def.qualifiedName ?? '';
+      const simpleName = q.includes('\\') ? q.slice(q.lastIndexOf('\\') + 1) : q;
+      if (simpleName === '') continue;
+      const fqn = `${ns}\\${simpleName}`;
+      let arr = fqnMap.get(fqn);
+      if (arr === undefined) {
+        arr = [];
+        fqnMap.set(fqn, arr);
       }
+      if (arr.some((b) => b.def.nodeId === def.nodeId)) continue;
+      arr.push({ def, origin: 'namespace' });
     }
   }
 
