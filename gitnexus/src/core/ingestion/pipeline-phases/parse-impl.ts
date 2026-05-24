@@ -46,6 +46,7 @@ import {
 import { createResolutionContext } from '../model/resolution-context.js';
 import { ASTCache, createASTCache } from '../ast-cache.js';
 import { type PipelineProgress, getLanguageFromFilename } from 'gitnexus-shared';
+import { isRegistryPrimary } from '../registry-primary-flag.js';
 import { readFileContents } from '../filesystem-walker.js';
 import { isLanguageAvailable } from '../../tree-sitter/parser-loader.js';
 import { createWorkerPool, WorkerPoolInitializationError } from '../workers/worker-pool.js';
@@ -607,7 +608,16 @@ export async function runChunkedParseAndResolve(
           anyChunkNeedsWildcardSynth = true;
         }
         for (const item of chunkWorkerData.imports) deferredWorkerImports.push(item);
-        for (const item of chunkWorkerData.calls) deferredWorkerCalls.push(item);
+        for (const item of chunkWorkerData.calls) {
+          // Skip calls for registry-primary languages (PHP, Python, Go, etc.).
+          // These are resolved by the scope-resolution phase, not
+          // processCallsFromExtracted. Accumulating them wastes memory on
+          // large codebases (269K+ objects for 14K PHP files → ~500MB).
+          // See: https://github.com/abhigyanpatwari/GitNexus/issues/1741
+          const itemLang = getLanguageFromFilename(item.filePath);
+          if (itemLang && isRegistryPrimary(itemLang)) continue;
+          deferredWorkerCalls.push(item);
+        }
         for (const item of chunkWorkerData.heritage) deferredWorkerHeritage.push(item);
         for (const item of chunkWorkerData.constructorBindings)
           deferredConstructorBindings.push(item);

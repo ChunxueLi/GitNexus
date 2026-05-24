@@ -43,18 +43,33 @@ type PhpTree = ReturnType<ReturnType<typeof getPhpParser>['parse']>;
 /**
  * Extract the declared namespace from a PHP file's source.
  * Uses the cached AST tree when available to avoid re-parsing.
+ *
+ * When no cached tree is available (worker-parsed files can't transfer
+ * native Tree objects across MessageChannels), uses a regex fast path
+ * instead of re-parsing every file with tree-sitter. For 16K+ PHP files
+ * this eliminates ~16K tree-sitter re-parses during the namespace-siblings
+ * pass. See: https://github.com/abhigyanpatwari/GitNexus/issues/1741
  */
 function extractPhpFileStructure(content: string, cachedTree: unknown): PhpFileStructure {
-  const tree =
-    (cachedTree as PhpTree | undefined) ??
-    parseSourceSafe(getPhpParser(), content, undefined, {
-      bufferSize: getTreeSitterBufferSize(content),
-    });
+  // Fast path: regex extraction when no cached tree available.
+  // PHP namespace declarations follow a predictable pattern:
+  //   namespace Foo\Bar;   OR   namespace Foo\Bar { ... }
+  if (!cachedTree) {
+    const match = content.match(/^\s*namespace\s+([\w\\]+)\s*[;{]/m);
+    if (match) {
+      return { namespace: match[1] };
+    }
+    const match2 = content.match(/namespace\s+([\w\\]+)\s*[;{]/);
+    if (match2) {
+      return { namespace: match2[1] };
+    }
+    return { namespace: '' };
+  }
 
   // Walk top-level nodes looking for namespace_definition.
   // PHP files have at most one namespace declaration (PSR-4 convention).
   // `namespace_definition` has a `name:` field of type `namespace_name`.
-  const root = tree.rootNode;
+  const root = (cachedTree as PhpTree).rootNode;
   for (let i = 0; i < root.namedChildCount; i++) {
     const child = root.namedChild(i);
     if (child === null) continue;
