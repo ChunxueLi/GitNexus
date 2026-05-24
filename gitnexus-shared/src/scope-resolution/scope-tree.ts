@@ -95,18 +95,35 @@ export function buildScopeTree(scopes: readonly Scope[]): ScopeTree {
   }
 
   // ── Pass 2: validate parent pointers + build children buckets ─────────
+  // Track scopes we re-parent so we can skip containment checks on them.
+  // Synthetic Module scopes have range 0:0-0:0 which can't geometrically
+  // contain any child — the containment invariant is structurally
+  // impossible for re-parented scopes and must be relaxed.
+  const reparented = new Set<string>();
   for (const scope of scopes) {
     if (scope.parent === null) {
       if (scope.kind !== 'Module') {
-        throw new ScopeTreeInvariantError(
-          'non-module-requires-parent',
-          `Scope '${scope.id}' has kind '${scope.kind}' but no parent. Only 'Module' scopes may be root-level.`,
+        // PHP template files (.phtml) and namespace-less scripts can
+        // produce orphan Function/Class scopes when tree-sitter parses
+        // inline closures but the root node is ERROR (no @scope.module).
+        // After ensureModuleScope synthesizes a Module scope, these
+        // children still have parent=null. Re-parent them under the
+        // synthetic Module scope for the same file instead of throwing.
+        const moduleScope = scopes.find(
+          (s) => s.kind === 'Module' && s.parent === null && s.filePath === scope.filePath,
         );
+        if (moduleScope) {
+          (scope as { parent: string | null }).parent = moduleScope.id;
+          reparented.add(scope.id);
+        } else {
+          continue;
+        }
+      } else {
+        continue;
       }
-      continue;
     }
 
-    const parent = byId.get(scope.parent);
+    const parent = byId.get(scope.parent!);
     if (parent === undefined) {
       throw new ScopeTreeInvariantError(
         'parent-not-found',
@@ -119,7 +136,9 @@ export function buildScopeTree(scopes: readonly Scope[]): ScopeTree {
         `Scope '${scope.id}' (${scope.filePath}) has parent '${parent.id}' in a different file (${parent.filePath}). Parent/child scopes must share filePath.`,
       );
     }
-    if (!canParentScope(parent.range, scope.range, parent.kind, scope.kind)) {
+    // Skip containment check for re-parented scopes — synthetic Module
+    // scopes have range 0:0-0:0 which cannot contain any child range.
+    if (!reparented.has(scope.id) && !canParentScope(parent.range, scope.range, parent.kind, scope.kind)) {
       throw new ScopeTreeInvariantError(
         'parent-must-contain-child',
         `Parent scope '${parent.id}' at ${formatRange(parent.range)} does not contain child '${scope.id}' at ${formatRange(scope.range)} (allowed: strict containment, or equal-range Module-as-parent).`,
