@@ -19,6 +19,7 @@ import {
 import { WikiGenerator, type WikiOptions } from '../core/wiki/generator.js';
 import { resolveLLMConfig, type LLMProvider } from '../core/wiki/llm-client.js';
 import { detectCursorCLI } from '../core/wiki/cursor-client.js';
+import { logger } from '../core/logger.js';
 
 export interface WikiCommandOptions {
   force?: boolean;
@@ -32,6 +33,26 @@ export interface WikiCommandOptions {
   provider?: LLMProvider;
   verbose?: boolean;
   review?: boolean;
+  timeout?: string;
+  retries?: string;
+  lang?: string;
+}
+
+function parsePositiveIntegerOption(
+  value: string | undefined,
+  flag: string,
+  multiplier = 1,
+): number | undefined {
+  if (value === undefined) return undefined;
+  const trimmed = value.trim();
+  if (!/^[1-9]\d*$/.test(trimmed)) {
+    throw new Error(`${flag} must be a positive integer`);
+  }
+  const parsed = parseInt(trimmed, 10);
+  if (parsed > Math.floor(Number.MAX_SAFE_INTEGER / multiplier)) {
+    throw new Error(`${flag} is too large`);
+  }
+  return parsed;
 }
 
 /**
@@ -86,6 +107,24 @@ function prompt(question: string, hide = false): Promise<string> {
 }
 
 export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptions) => {
+  // Snapshot GITNEXUS_VERBOSE at entry — wikiCommand mutates it (the impl
+  // below) so cursor-client (process.env-driven) sees the right value during
+  // this run. Restored in finally so back-to-back wiki calls in long-running
+  // hosts don't leak verbose state from one invocation to the next. Pairs
+  // with the same snapshot/restore pattern in `analyzeCommand`.
+  const originalVerbose = process.env.GITNEXUS_VERBOSE;
+  try {
+    await wikiCommandImpl(inputPath, options);
+  } finally {
+    if (originalVerbose === undefined) {
+      delete process.env.GITNEXUS_VERBOSE;
+    } else {
+      process.env.GITNEXUS_VERBOSE = originalVerbose;
+    }
+  }
+};
+
+const wikiCommandImpl = async (inputPath?: string, options?: WikiCommandOptions): Promise<void> => {
   // Set verbose mode globally for cursor-client to pick up
   if (options?.verbose) {
     process.env.GITNEXUS_VERBOSE = '1';
@@ -120,6 +159,17 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
   if (!meta) {
     console.log('  Error: No GitNexus index found.');
     console.log('  Run `gitnexus analyze` first to index this repository.\n');
+    process.exitCode = 1;
+    return;
+  }
+
+  let timeoutSeconds: number | undefined;
+  let retries: number | undefined;
+  try {
+    timeoutSeconds = parsePositiveIntegerOption(options?.timeout, '--timeout', 1000);
+    retries = parsePositiveIntegerOption(options?.retries, '--retries');
+  } catch (error) {
+    console.log(`  Error: ${(error as Error).message}\n`);
     process.exitCode = 1;
     return;
   }
@@ -346,6 +396,14 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     }
   }
 
+  // ── Apply per-run overrides not saved to config ────────────────────
+  if (timeoutSeconds !== undefined) {
+    llmConfig.requestTimeoutMs = timeoutSeconds * 1000;
+  }
+  if (retries !== undefined) {
+    llmConfig.maxAttempts = retries;
+  }
+
   // ── Setup progress bar with elapsed timer ──────────────────────────
   const bar = new cliProgress.SingleBar(
     {
@@ -382,6 +440,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     force: options?.force,
     concurrency: options?.concurrency ? parseInt(options.concurrency, 10) : undefined,
     reviewOnly: options?.review,
+    lang: options?.lang,
   };
 
   const generator = new WikiGenerator(
@@ -460,7 +519,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
         console.log('  Save and close the editor when done.\n');
 
         try {
-          execFileSync(editor, [treeFile], { stdio: 'inherit' });
+          execFileSync(editor, [treeFile], { stdio: 'inherit', windowsHide: true });
         } catch {
           console.log(`  Could not open editor. Please edit manually:\n  ${treeFile}\n`);
           console.log('  Then run `gitnexus wiki` to continue.\n');
@@ -550,6 +609,8 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
     if (err.message?.includes('No source files')) {
       console.log(`\n  ${err.message}\n`);
+    } else if (err.message?.includes('LLM request timed out after')) {
+      console.log(`\n  Timeout: ${err.message}\n`);
     } else if (err.message?.includes('content filter')) {
       // Content filter block — actionable message
       console.log(`\n  Content Filter: ${err.message}\n`);
@@ -583,7 +644,7 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
     } else {
       console.log(`\n  Error: ${err.message}\n`);
       if (process.env.GITNEXUS_VERBOSE) {
-        console.error(err);
+        logger.error({ err }, 'wiki command failed');
       }
     }
     process.exitCode = 1;
@@ -594,8 +655,40 @@ export const wikiCommand = async (inputPath?: string, options?: WikiCommandOptio
 
 function hasGhCLI(): boolean {
   try {
-    execSync('gh --version', { stdio: 'ignore' });
+    execSync('gh --version', { stdio: 'ignore', windowsHide: true });
     return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Strict Gist URL predicate. Rejects:
+ *   - any URL that does not parse (URL constructor throws)
+ *   - schemes other than https (drops `http:`, `file:`, `gist:`-style spoofs)
+ *   - hostnames that are not exactly `gist.github.com` (drops substring spoofs
+ *     like `https://evil.com/?u=gist.github.com` and userinfo-prefixed shapes
+ *     like `https://[email protected]/...` — note that URL.hostname
+ *     strips userinfo, so the equality check rejects the userinfo-prefixed
+ *     spoof if the actual host differs from gist.github.com)
+ *   - any URL containing userinfo (`username[:password]@`), which the URL
+ *     parser exposes via `.username` / `.password`. Defense-in-depth: even
+ *     when hostname matches, a credential-bearing URL is suspect and not
+ *     produced by `gh gist create`.
+ *
+ * Closes the substring-bypass class CodeQL `js/incomplete-url-substring-
+ * sanitization` flags.
+ */
+function isGistUrl(line: string): boolean {
+  const trimmed = line.trim();
+  try {
+    const u = new URL(trimmed);
+    return (
+      u.protocol === 'https:' &&
+      u.hostname === 'gist.github.com' &&
+      u.username === '' &&
+      u.password === ''
+    );
   } catch {
     return false;
   }
@@ -606,16 +699,17 @@ function publishGist(htmlPath: string): { url: string; rawUrl: string } | null {
     const output = execFileSync(
       'gh',
       ['gist', 'create', htmlPath, '--desc', 'Repository Wiki — generated by GitNexus', '--public'],
-      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] },
+      { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true },
     ).trim();
 
-    // gh gist create prints the gist URL as the last line
-    const lines = output.split('\n');
-    const gistUrl = lines.find((l) => l.includes('gist.github.com')) || lines[lines.length - 1];
+    // `gh gist create` prints the gist URL as a line in the output. Find the
+    // first parseable Gist URL — if no line is a valid Gist URL, fail closed
+    // (do NOT fall back to lines[last]: a non-Gist last line would propagate
+    // through the regex below and produce a malformed `rawUrl`).
+    const gistUrl = output.split('\n').find(isGistUrl);
+    if (!gistUrl) return null;
 
-    if (!gistUrl || !gistUrl.includes('gist.github.com')) return null;
-
-    // Build a raw viewer URL via gist.githack.com
+    // Build a raw viewer URL via gist.githack.com.
     // gist URL format: https://gist.github.com/{user}/{id}
     const match = gistUrl.match(/gist\.github\.com\/([^/]+)\/([a-f0-9]+)/);
     let rawUrl = gistUrl;

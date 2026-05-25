@@ -70,8 +70,19 @@ before(async () => {
   await waitForServer(serverPort);
 });
 
+function killAndWait(proc) {
+  return new Promise((resolve) => {
+    if (!proc || proc.exitCode !== null) {
+      resolve();
+      return;
+    }
+    proc.on('exit', resolve);
+    proc.kill();
+  });
+}
+
 after(async () => {
-  child?.kill();
+  await killAndWait(child);
   if (tmpDir) await rm(tmpDir, { recursive: true, force: true });
 });
 
@@ -97,6 +108,23 @@ it('rejects path traversal with 400', async () => {
 
 it('rejects percent-encoded null bytes with 400', async () => {
   const res = await rawGet(serverPort, '/foo%00bar');
+  assert.equal(res.status, 400);
+});
+
+it('rejects percent-encoded path traversal with 400', async () => {
+  // %2e%2e%2f decodes to '../'. Without the path.relative inline barrier,
+  // a naive string check on the raw URL would let this through and only
+  // the lexical-decoded path.resolve would catch it. Confirm the barrier
+  // does its job after decodeURIComponent.
+  const res = await rawGet(serverPort, '/%2e%2e%2f%2e%2e%2fetc%2fpasswd');
+  assert.equal(res.status, 400);
+});
+
+it('rejects malformed percent-encoding with 400', async () => {
+  // %GG is not a valid percent-encoded sequence — decodeURIComponent throws.
+  // The handler's try/catch around decode must convert this to a 400 rather
+  // than an unhandled rejection.
+  const res = await rawGet(serverPort, '/foo%GGbar');
   assert.equal(res.status, 400);
 });
 
@@ -137,7 +165,7 @@ async function withInjectionServer(envOverrides, fn) {
     await waitForServer(port);
     await fn(port);
   } finally {
-    proc.kill();
+    await killAndWait(proc);
     await rm(dir, { recursive: true, force: true });
   }
 }
@@ -215,7 +243,10 @@ it('escapes </script> in GITNEXUS_BACKEND_URL to prevent XSS', async () => {
       `Expected exactly 1 <script> tag but found ${scriptMatches.length}: XSS breakout detected`,
     );
 
-    assert.ok(!res.body.includes('alert(1)'), 'Injected alert() must not appear unescaped in HTML');
+    assert.ok(
+      !res.body.includes('</script><script>'),
+      '</script> must not appear unescaped -- would allow script breakout',
+    );
     assert.ok(res.body.includes('\\u003c'), 'Angle brackets must be escaped as \\u003c');
   });
 });

@@ -4,7 +4,7 @@
  *
  * Why this script exists:
  *   tree-sitter-proto is vendored under gitnexus/vendor/tree-sitter-proto/
- *   and declared as a `file:` optionalDependency. Previously, the vendored
+ *   and copied into node_modules/ by materialize-vendor-grammars.cjs. Previously, the vendored
  *   package had its own `dependencies` and `install` script, which caused
  *   npm to create `vendor/tree-sitter-proto/node_modules/` and
  *   `vendor/tree-sitter-proto/build/` during install. Those directories
@@ -20,9 +20,8 @@
  *   gitnexus's own optionalDependencies, and moved native compilation here.
  *
  * What this does:
- *   Runs `npx node-gyp rebuild` inside `node_modules/tree-sitter-proto/`
- *   (which npm creates as a copy of vendor/tree-sitter-proto/ when
- *   resolving the file: dep). Build output lands in
+ *   Runs `npx node-gyp rebuild` inside `node_modules/tree-sitter-proto/`.
+ *   Build output lands in
  *   `node_modules/tree-sitter-proto/build/Release/tree_sitter_proto_binding.node`
  *   — under npm-managed territory, safe on upgrade.
  *
@@ -33,6 +32,17 @@
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+
+// Opt-out: skip the native rebuild entirely. Proto parsing becomes
+// unavailable but `npm install gitnexus` finishes much faster on machines
+// without a C++ toolchain. Strict `=== '1'` only — '=true', '=yes', '=0'
+// (read as a string), and any other value all fall through to the rebuild.
+if (process.env.GITNEXUS_SKIP_OPTIONAL_GRAMMARS === '1') {
+  console.warn(
+    '[tree-sitter-proto] Skipping build (GITNEXUS_SKIP_OPTIONAL_GRAMMARS=1). Proto parsing will be unavailable until reinstalled without the env var.',
+  );
+  process.exit(0);
+}
 
 const protoDir = path.join(__dirname, '..', 'node_modules', 'tree-sitter-proto');
 const bindingGyp = path.join(protoDir, 'binding.gyp');

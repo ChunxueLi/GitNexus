@@ -59,7 +59,7 @@ const RECHAIN_MAX_DEPTH = 8;
  *  `followChainedRef` but operates on post-finalize Scope objects so
  *  it can see imported return-types propagated by
  *  `propagateImportedReturnTypes`. */
-function followChainPostFinalize(
+export function followChainPostFinalize(
   start: TypeRef,
   fromScopeId: ScopeId,
   scopes: ScopeResolutionIndexes,
@@ -151,7 +151,8 @@ export function propagateImportedReturnTypes(
 
         const refs = lookupBindingsAt(importerModule.id, localName, indexes);
         for (const ref of refs) {
-          if (ref.origin !== 'import' && ref.origin !== 'reexport') continue;
+          if (ref.origin !== 'import' && ref.origin !== 'reexport' && ref.origin !== 'wildcard')
+            continue;
           const sourceModule = moduleScopeByFile.get(ref.def.filePath);
           if (sourceModule === undefined) continue;
 

@@ -39,14 +39,27 @@ import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename, SupportedLanguages } from 'gitnexus-shared';
 import { isRegistryPrimary } from './registry-primary-flag.js';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
-import { yieldToEventLoop } from './utils/event-loop.js';
 import {
+  deferredCallFileSlowMs,
+  deferredCallLogEveryN,
+  getDeferredProfileDroppedCount,
+  isDeferredResolutionProfileEnabled,
+  logDeferredProfile,
+  profileElapsedMs,
+  resetDeferredProfileDroppedCount,
+  startTimer,
+} from './utils/deferred-resolution-profile.js';
+import { yieldToEventLoop } from './utils/event-loop.js';
+import { parseSourceSafe } from '../tree-sitter/safe-parse.js';
+import {
+  CLASS_CONTAINER_TYPES,
   FUNCTION_NODE_TYPES,
-  findEnclosingClassId,
   findEnclosingClassInfo,
   genericFuncName,
   inferFunctionLabel,
 } from './utils/ast-helpers.js';
+import type { FieldInfo, FieldExtractorContext } from './field-types.js';
+import type { LanguageProvider } from './language-provider.js';
 import { typeTagForId, constTagForId, buildCollisionGroups } from './utils/method-props.js';
 import type { MethodInfo } from './method-types.js';
 import {
@@ -74,6 +87,63 @@ import { extractTemplateComponents } from './vue-sfc-extractor.js';
 import { extractReturnTypeName, stripNullable } from './type-extractors/shared.js';
 import type { LiteralTypeInferrer } from './type-extractors/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+
+import { logger } from '../logger.js';
+
+// ── Property-prepass helpers (parity with parse-worker.ts) ──
+// These mirror the sequential-path equivalents in parse-worker.ts so the main-
+// thread `processCalls` pre-pass produces byte-identical Property nodes/symbols
+// to the worker pool. Drift between the two paths breaks the
+// `incremental ≡ --force` invariant the moment a repo crosses the worker
+// threshold between runs.
+
+/** Walk up to the nearest enclosing class/struct/interface AST node. */
+const findEnclosingClassNode = (node: SyntaxNode): SyntaxNode | null => {
+  let current = node.parent;
+  while (current) {
+    if (CLASS_CONTAINER_TYPES.has(current.type)) return current;
+    current = current.parent;
+  }
+  return null;
+};
+
+/** No-op SymbolTable stub for FieldExtractorContext — matches parse-worker. */
+const NOOP_SYMBOL_TABLE: SymbolTableReader = {
+  lookupExact: () => undefined,
+  lookupExactFull: () => undefined,
+  lookupExactAll: () => [],
+  lookupCallableByName: () => [],
+  getFiles: () => [][Symbol.iterator](),
+  getStats: () => ({ fileCount: 0 }),
+};
+
+/**
+ * Extract (and cache) field info for a class node. Cache is passed in so it
+ * stays scoped to a single `processCalls` invocation rather than leaking
+ * across analyze runs (worker uses module-level caching because each worker
+ * process is short-lived; the main thread is not).
+ *
+ * Cache key is `${filePath}:${classNode.startIndex}` — startIndex alone is a
+ * per-file byte offset, so almost every Ruby/Python file's leading class lands
+ * at byte 0 and would collide across files in the shared map.
+ */
+const getFieldInfo = (
+  classNode: SyntaxNode,
+  provider: LanguageProvider,
+  context: FieldExtractorContext,
+  cache: Map<string, Map<string, FieldInfo>>,
+): Map<string, FieldInfo> | undefined => {
+  if (!provider.fieldExtractor) return undefined;
+  const cacheKey = `${context.filePath}:${classNode.startIndex}`;
+  const cached = cache.get(cacheKey);
+  if (cached) return cached;
+  const result = provider.fieldExtractor.extract(classNode, context);
+  if (!result?.fields?.length) return undefined;
+  const map = new Map<string, FieldInfo>();
+  for (const field of result.fields) map.set(field.name, field);
+  cache.set(cacheKey, map);
+  return map;
+};
 
 /** Per-file resolved type bindings for exported symbols.
  *  Populated during call processing, consumed by Phase 14 re-resolution pass. */
@@ -706,6 +776,15 @@ export const processCalls = async (
   importedRawReturnTypesMap?: ReadonlyMap<string, ReadonlyMap<string, string>>,
   heritageMap?: HeritageMap,
   bindingAccumulator?: BindingAccumulator,
+  /**
+   * Optional cache for compiled `Parser.Query` objects keyed by language name.
+   * When provided, compiled queries are reused across calls instead of being
+   * re-compiled from the query string for every file. Callers that invoke
+   * `processCalls` many times with single-file batches (e.g. the cross-file
+   * propagation phase) should pass a long-lived map here to avoid O(N)
+   * query recompilation overhead.
+   */
+  compiledQueryCache?: Map<SupportedLanguages, Parser.Query>,
 ): Promise<ExtractedHeritage[]> => {
   const parser = await loadParser();
   const collectedHeritage: ExtractedHeritage[] = [];
@@ -714,6 +793,7 @@ export const processCalls = async (
     propertyName: string;
     filePath: string;
     srcId: string;
+    line?: number;
   }[] = [];
   // Phase P cross-file: accumulate heritage across files for cross-file isSubclassOf.
   // Used as a secondary check when per-file parentMap lacks the relationship — helps
@@ -768,9 +848,10 @@ export const processCalls = async (
 
     let tree = astCache.get(file.path);
     if (!tree) {
+      const parseContent = provider.preprocessSource?.(file.content, file.path) ?? file.content;
       try {
-        tree = parser.parse(file.content, undefined, {
-          bufferSize: getTreeSitterBufferSize(file.content),
+        tree = parseSourceSafe(parser, parseContent, undefined, {
+          bufferSize: getTreeSitterBufferSize(parseContent),
         });
       } catch (parseError) {
         continue;
@@ -781,10 +862,14 @@ export const processCalls = async (
     let matches;
     try {
       const lang = parser.getLanguage();
-      const query = new Parser.Query(lang, queryStr);
+      let query = compiledQueryCache?.get(language);
+      if (!query) {
+        query = new Parser.Query(lang, queryStr);
+        compiledQueryCache?.set(language, query);
+      }
       matches = query.matches(tree.rootNode);
     } catch (queryError) {
-      console.warn(`Query error for ${file.path}:`, queryError);
+      logger.warn({ queryError }, `Query error for ${file.path}:`);
       continue;
     }
 
@@ -855,6 +940,120 @@ export const processCalls = async (
     }
 
     prepared.push({ file, language, provider, tree, matches, parentMap, typeEnv });
+  }
+
+  // ── Property-registration pre-pass ──
+  // Register all routed properties (e.g. Ruby attr_accessor) BEFORE the
+  // resolution loop so cross-file field-type lookups (e.g.
+  // `user.address.save → Address#save`) succeed regardless of file
+  // processing order. This MUST stay in lockstep with the equivalent
+  // worker-path block in parse-worker.ts (kind === 'properties') — any
+  // divergence between the two paths breaks the `incremental ≡ --force`
+  // invariant once a repo crosses the worker threshold between runs.
+  const fieldInfoCache = new Map<string, Map<string, FieldInfo>>();
+  for (const { file, language, provider, matches, typeEnv } of prepared) {
+    const callRouter = provider.callRouter;
+    if (!callRouter) continue;
+    matches.forEach((match) => {
+      const captureMap: Record<string, any> = {};
+      match.captures.forEach((c) => (captureMap[c.name] = c.node));
+      if (!captureMap['call']) return;
+      const callNameNode = captureMap['call.name'];
+      if (!callNameNode) return;
+      const routed = callRouter(callNameNode.text, captureMap['call']);
+      if (!routed || routed.kind !== 'properties') return;
+
+      const propEnclosingInfo = findEnclosingClassInfo(
+        captureMap['call'],
+        file.path,
+        provider.resolveEnclosingOwner,
+      );
+      const propEnclosingClassId = propEnclosingInfo?.classId ?? null;
+
+      // Enrich routed properties with FieldExtractor metadata so types
+      // discovered from constructor assignments (e.g. `@address = Address.new`)
+      // are propagated even when the routing payload itself lacks declaredType.
+      let routedFieldMap: Map<string, FieldInfo> | undefined;
+      if (provider.fieldExtractor && typeEnv) {
+        const classNode = findEnclosingClassNode(captureMap['call']);
+        if (classNode) {
+          routedFieldMap = getFieldInfo(
+            classNode,
+            provider,
+            {
+              typeEnv,
+              symbolTable: NOOP_SYMBOL_TABLE,
+              filePath: file.path,
+              language,
+            },
+            fieldInfoCache,
+          );
+        }
+      }
+
+      const fileId = generateId('File', file.path);
+      for (const item of routed.items) {
+        const routedFieldInfo = routedFieldMap?.get(item.propName);
+        const propQualifiedName = propEnclosingInfo
+          ? `${propEnclosingInfo.className}.${item.propName}`
+          : item.propName;
+        const nodeId = generateId('Property', `${file.path}:${propQualifiedName}`);
+        graph.addNode({
+          id: nodeId,
+          label: 'Property',
+          properties: {
+            name: item.propName,
+            filePath: file.path,
+            startLine: item.startLine,
+            endLine: item.endLine,
+            language,
+            isExported: true,
+            description: item.accessorType,
+            ...(item.declaredType
+              ? { declaredType: item.declaredType }
+              : routedFieldInfo?.type
+                ? { declaredType: routedFieldInfo.type }
+                : {}),
+            ...(routedFieldInfo?.visibility !== undefined
+              ? { visibility: routedFieldInfo.visibility }
+              : {}),
+            ...(routedFieldInfo?.isStatic !== undefined
+              ? { isStatic: routedFieldInfo.isStatic }
+              : {}),
+            ...(routedFieldInfo?.isReadonly !== undefined
+              ? { isReadonly: routedFieldInfo.isReadonly }
+              : {}),
+          },
+        });
+        ctx.model.symbols.add(file.path, item.propName, nodeId, 'Property', {
+          ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
+          ...(item.declaredType
+            ? { declaredType: item.declaredType }
+            : routedFieldInfo?.type
+              ? { declaredType: routedFieldInfo.type }
+              : {}),
+        });
+        const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
+        graph.addRelationship({
+          id: relId,
+          sourceId: fileId,
+          targetId: nodeId,
+          type: 'DEFINES',
+          confidence: 1.0,
+          reason: '',
+        });
+        if (propEnclosingClassId) {
+          graph.addRelationship({
+            id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
+            sourceId: propEnclosingClassId,
+            targetId: nodeId,
+            type: 'HAS_PROPERTY',
+            confidence: 1.0,
+            reason: '',
+          });
+        }
+      }
+    });
   }
 
   // ── Resolution loop: verify constructor bindings and resolve calls ──
@@ -930,7 +1129,13 @@ export const processCalls = async (
           // Defer resolution: Ruby attr_accessor properties are registered during
           // this same loop, so cross-file lookups fail if the declaring file hasn't
           // been processed yet. Collect now, resolve after all files are done.
-          pendingWrites.push({ receiverTypeName, propertyName, filePath: file.path, srcId });
+          pendingWrites.push({
+            receiverTypeName,
+            propertyName,
+            filePath: file.path,
+            srcId,
+            line: captureMap['assignment'].startPosition.row + 1,
+          });
         }
         // Assignment-only capture (no @call sibling): skip the rest of this
         // forEach iteration — this acts as a `continue` in the match loop.
@@ -1050,47 +1255,8 @@ export const processCalls = async (
             return;
 
           case 'properties': {
-            const fileId = generateId('File', file.path);
-            const propEnclosingClassId = findEnclosingClassId(captureMap['call'], file.path);
-            for (const item of routed.items) {
-              const nodeId = generateId('Property', `${file.path}:${item.propName}`);
-              graph.addNode({
-                id: nodeId,
-                label: 'Property',
-                properties: {
-                  name: item.propName,
-                  filePath: file.path,
-                  startLine: item.startLine,
-                  endLine: item.endLine,
-                  language,
-                  isExported: true,
-                  description: item.accessorType,
-                },
-              });
-              ctx.model.symbols.add(file.path, item.propName, nodeId, 'Property', {
-                ...(propEnclosingClassId ? { ownerId: propEnclosingClassId } : {}),
-                ...(item.declaredType ? { declaredType: item.declaredType } : {}),
-              });
-              const relId = generateId('DEFINES', `${fileId}->${nodeId}`);
-              graph.addRelationship({
-                id: relId,
-                sourceId: fileId,
-                targetId: nodeId,
-                type: 'DEFINES',
-                confidence: 1.0,
-                reason: '',
-              });
-              if (propEnclosingClassId) {
-                graph.addRelationship({
-                  id: generateId('HAS_PROPERTY', `${propEnclosingClassId}->${nodeId}`),
-                  sourceId: propEnclosingClassId,
-                  targetId: nodeId,
-                  type: 'HAS_PROPERTY',
-                  confidence: 1.0,
-                  reason: '',
-                });
-              }
-            }
+            // Properties already registered in the pre-pass above.
+            // Skip to avoid duplicate nodes/edges.
             return;
           }
 
@@ -1379,7 +1545,10 @@ export const processCalls = async (
     );
     if (fieldOwner) {
       graph.addRelationship({
-        id: generateId('ACCESSES', `${pw.srcId}:${fieldOwner.nodeId}:write`),
+        id: generateId(
+          'ACCESSES',
+          `${pw.srcId}:${fieldOwner.nodeId}:write${pw.line !== undefined ? `:${pw.line}` : ''}`,
+        ),
         sourceId: pw.srcId,
         targetId: fieldOwner.nodeId,
         type: 'ACCESSES',
@@ -1391,7 +1560,7 @@ export const processCalls = async (
 
   if (skippedByLang && skippedByLang.size > 0) {
     for (const [lang, count] of skippedByLang.entries()) {
-      console.warn(
+      logger.warn(
         `[ingestion] Skipped ${count} ${lang} file(s) in call processing — ${lang} parser not available.`,
       );
     }
@@ -2750,6 +2919,39 @@ export const processCallsFromExtracted = async (
   }
   const totalFiles = byFile.size;
   let filesProcessed = 0;
+  // Counts only files that survived the registry-primary skip — what the user
+  // is actually waiting on. Keyed by this counter, the first per-file progress
+  // log fires on the first *resolved* file rather than file #1 of byFile,
+  // which would silently land inside the skip block on mixed Python+JVM repos
+  // where the skipped language sorts first.
+  let resolvedFiles = 0;
+  const profileCalls = isDeferredResolutionProfileEnabled();
+  const slowFileMs = profileCalls ? deferredCallFileSlowMs() : 0;
+  const logEveryN = profileCalls ? deferredCallLogEveryN() : 0;
+  let skippedRegistryPrimaryFiles = 0;
+
+  // Fresh dropped-log counter per analyze run — the module-private counter
+  // in deferred-resolution-profile.ts is process-lived, so without a reset
+  // here it would accumulate across consecutive analyze invocations in the
+  // same Node process (e.g., the MCP server, eval harness, integration
+  // tests).
+  if (profileCalls) resetDeferredProfileDroppedCount();
+
+  // One-pass pre-count of the eventual non-skipped total so the live progress
+  // denominator stays stable as the loop iterates. Otherwise `${totalFiles -
+  // skippedRegistryPrimaryFiles}` drifts upward — files iterated before later
+  // registry-primary skips have been seen carry an inflated denominator, and
+  // the ratio only self-corrects after every file has been classified. Pre-
+  // count runs only on the enabled path so the disabled path stays free of
+  // the extra Map iteration. Defaults to 0 on the disabled path; the live log
+  // gate is also disabled there, so the value is never read.
+  let resolvedTotal = 0;
+  if (profileCalls) {
+    for (const filePath of byFile.keys()) {
+      const lang = getLanguageFromFilename(filePath);
+      if (!lang || !isRegistryPrimary(lang)) resolvedTotal++;
+    }
+  }
 
   for (const [filePath, calls] of byFile) {
     filesProcessed++;
@@ -2761,7 +2963,19 @@ export const processCallsFromExtracted = async (
     // Registry-primary gate: skip Python (etc.) entirely when the
     // scope-based phase owns CALLS for this language.
     const fileLanguage = getLanguageFromFilename(filePath);
-    if (fileLanguage && isRegistryPrimary(fileLanguage)) continue;
+    if (fileLanguage && isRegistryPrimary(fileLanguage)) {
+      skippedRegistryPrimaryFiles++;
+      continue;
+    }
+
+    resolvedFiles++;
+    const tFile = startTimer(profileCalls);
+
+    if (profileCalls && (resolvedFiles === 1 || resolvedFiles % logEveryN === 0)) {
+      logDeferredProfile(
+        `calls ${resolvedFiles}/${resolvedTotal} file=${filePath} sites=${calls.length}`,
+      );
+    }
 
     ctx.enableCache(filePath);
     const widenCache: WidenCache = new Map();
@@ -2920,6 +3134,25 @@ export const processCallsFromExtracted = async (
     }
 
     ctx.clearCache();
+
+    if (tFile !== null) {
+      const elapsed = profileElapsedMs(tFile);
+      if (elapsed >= slowFileMs) {
+        logDeferredProfile(
+          `slow file ${elapsed.toFixed(0)}ms path=${filePath} calls=${calls.length} lang=${fileLanguage ?? 'unknown'}`,
+        );
+      }
+    }
+  }
+
+  if (profileCalls) {
+    logDeferredProfile(
+      `processCallsFromExtracted done: ${totalFiles} files, ${extractedCalls.length} call sites, skipped registry-primary files=${skippedRegistryPrimaryFiles}`,
+    );
+    const droppedCount = getDeferredProfileDroppedCount();
+    if (droppedCount > 0) {
+      logDeferredProfile(`note: ${droppedCount} profile log lines dropped (logger errors)`);
+    }
   }
 
   onProgress?.(totalFiles, totalFiles);
@@ -2976,7 +3209,10 @@ export const processAssignmentsFromExtracted = (
     const fieldOwner = resolveFieldOwnership(receiverTypeName, asn.propertyName, asn.filePath, ctx);
     if (!fieldOwner) continue;
     graph.addRelationship({
-      id: generateId('ACCESSES', `${asn.sourceId}:${fieldOwner.nodeId}:write`),
+      id: generateId(
+        'ACCESSES',
+        `${asn.sourceId}:${fieldOwner.nodeId}:write${asn.line !== undefined ? `:${asn.line}` : ''}`,
+      ),
       sourceId: asn.sourceId,
       targetId: fieldOwner.nodeId,
       type: 'ACCESSES',
@@ -3279,9 +3515,10 @@ export const extractFetchCallsFromFiles = async (
 
     let tree = astCache.get(file.path);
     if (!tree) {
+      const parseContent = provider.preprocessSource?.(file.content, file.path) ?? file.content;
       try {
-        tree = parser.parse(file.content, undefined, {
-          bufferSize: getTreeSitterBufferSize(file.content),
+        tree = parseSourceSafe(parser, parseContent, undefined, {
+          bufferSize: getTreeSitterBufferSize(parseContent),
         });
       } catch {
         continue;

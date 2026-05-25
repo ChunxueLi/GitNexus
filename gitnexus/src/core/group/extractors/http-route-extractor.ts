@@ -5,6 +5,7 @@ import { createIgnoreFilter } from '../../../config/ignore-service.js';
 import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js';
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
 import { getPluginForFile, HTTP_SCAN_GLOB, type HttpDetection } from './http-patterns/index.js';
 
 /**
@@ -17,12 +18,14 @@ import { getPluginForFile, HTTP_SCAN_GLOB, type HttpDetection } from './http-pat
  *    the preferred path because the graph has richer symbol metadata
  *    (real uids, class/method structure, etc.).
  *
- * 2. **Source-scan fallback (Strategy B)** — parse files directly with
- *    the per-language plugin registry in `./http-patterns/`. Used when
- *    the graph has no routes/fetches for this repo (e.g. a repo that
- *    hasn't been indexed yet, or whose indexer doesn't know the
- *    framework). Each plugin owns its tree-sitter grammar and query
- *    sources — this orchestrator imports NO grammars or query strings.
+ * 2. **Source-scan supplement (Strategy B)** — parse files directly with
+ *    the per-language plugin registry in `./http-patterns/`. Used to
+ *    fill gaps when graph extraction only covers part of a polyglot repo
+ *    (e.g. Java graph routes plus Go source-scan routes). Graph entries
+ *    remain authoritative for duplicate contract IDs because they carry
+ *    richer symbol metadata. Each plugin owns its tree-sitter grammar
+ *    and query sources — this orchestrator imports NO grammars or query
+ *    strings.
  *
  * Adding a new language for Strategy B is a one-file edit in
  * `http-patterns/index.ts`: register a new `HttpLanguagePlugin` and
@@ -172,7 +175,7 @@ export class HttpRouteExtractor implements ContractExtractor {
       }
       try {
         parser.setLanguage(plugin.language);
-        const tree = parser.parse(content);
+        const tree = parseSourceSafe(parser, content);
         const detections = plugin.scan(tree);
         cachedDetections.set(rel, detections);
         return detections;
@@ -193,17 +196,19 @@ export class HttpRouteExtractor implements ContractExtractor {
 
     const graphProviders =
       dbExecutor != null ? await this.extractProvidersGraph(dbExecutor, getDetections) : [];
-    const providers =
-      graphProviders.length > 0
-        ? graphProviders
-        : this.extractProvidersSourceScan(await getScannedFiles(), getDetections);
+    // Source scan always runs to capture routes in languages/files not covered
+    // by graph edges; the glob and per-file parse results are cached above.
+    const providers = this.mergeGraphAndSourceContracts(
+      graphProviders,
+      this.extractProvidersSourceScan(await getScannedFiles(), getDetections),
+    );
 
     const graphConsumers =
       dbExecutor != null ? await this.extractConsumersGraph(dbExecutor, getDetections) : [];
-    const consumers =
-      graphConsumers.length > 0
-        ? graphConsumers
-        : this.extractConsumersSourceScan(await getScannedFiles(), getDetections);
+    const consumers = this.mergeGraphAndSourceContracts(
+      graphConsumers,
+      this.extractConsumersSourceScan(await getScannedFiles(), getDetections),
+    );
 
     return [...providers, ...consumers];
   }
@@ -469,6 +474,20 @@ export class HttpRouteExtractor implements ContractExtractor {
       if (seen.has(k)) continue;
       seen.add(k);
       out.push(c);
+    }
+    return out;
+  }
+
+  private mergeGraphAndSourceContracts(
+    graphContracts: ExtractedContract[],
+    sourceContracts: ExtractedContract[],
+  ): ExtractedContract[] {
+    const seenContractIds = new Set(graphContracts.map((c) => c.contractId));
+    const out = [...graphContracts];
+    for (const contract of sourceContracts) {
+      if (seenContractIds.has(contract.contractId)) continue;
+      seenContractIds.add(contract.contractId);
+      out.push(contract);
     }
     return out;
   }

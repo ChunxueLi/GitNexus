@@ -5,6 +5,8 @@ import { createIgnoreFilter } from '../../../config/ignore-service.js';
 import type { ContractExtractor, CypherExecutor } from '../contract-extractor.js';
 import type { ExtractedContract, RepoHandle } from '../types.js';
 import { readSafe } from './fs-utils.js';
+import { parseSourceSafe } from '../../tree-sitter/safe-parse.js';
+import { logger } from '../../logger.js';
 import {
   GRPC_SCAN_GLOB,
   getPluginForFile,
@@ -344,7 +346,7 @@ export function resolveProtoConflict(
   // services under a fabricated package-qualified contract id.
   if (winners.length !== 1) {
     const paths = candidates.map((c) => c.protoPath).join(', ');
-    console.warn(
+    logger.warn(
       `[grpc-extractor] Ambiguous proto resolution for service "${serviceName}" from ${sourceFilePath}: ${winners.length} candidates tied at score ${maxScore} among [${paths}] — skipping canonical contract`,
     );
     return null;
@@ -427,7 +429,7 @@ export class GrpcExtractor implements ContractExtractor {
       let detections: GrpcDetection[] = [];
       try {
         parser.setLanguage(plugin.language);
-        const tree = parser.parse(content);
+        const tree = parseSourceSafe(parser, content);
         detections = plugin.scan(tree);
       } catch {
         continue;

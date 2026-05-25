@@ -18,7 +18,11 @@ export type { NodeTableName, RelType } from './lbug/schema-constants.js';
 
 // Language support
 export { SupportedLanguages } from './languages.js';
-export { getLanguageFromFilename, getSyntaxLanguageFromFilename } from './language-detection.js';
+export {
+  getLanguageFromFilename,
+  getSyntaxLanguageFromFilename,
+  isBladeTemplateFilename,
+} from './language-detection.js';
 export type { MroStrategy } from './mro-strategy.js';
 
 // Pipeline progress
@@ -26,7 +30,7 @@ export type { PipelinePhase, PipelineProgress } from './pipeline.js';
 
 // ─── Scope-based resolution — RFC #909 (Ring 1 #910) ────────────────────────
 // Data model (RFC §2)
-export type { SymbolDefinition } from './scope-resolution/symbol-definition.js';
+export type { ParameterTypeClass, SymbolDefinition } from './scope-resolution/symbol-definition.js';
 export type {
   ScopeId,
   DefId,
@@ -127,8 +131,10 @@ export { CLASS_KINDS, METHOD_KINDS, FIELD_KINDS } from './scope-resolution/regis
 export type {
   RegistryContext,
   RegistryProviders,
+  OwnedMembersByOwnerLookup,
   OwnerScopedContributor,
   ArityVerdict,
+  ConstraintContext,
 } from './scope-resolution/registries/context.js';
 
 // Scope tree spine + position lookup (RFC §2.2 + §3.1; Ring 2 SHARED #912)
@@ -142,6 +148,34 @@ export {
 export type { ScopeTree } from './scope-resolution/scope-tree.js';
 export { buildPositionIndex } from './scope-resolution/position-index.js';
 export type { PositionIndex } from './scope-resolution/position-index.js';
+
+// Resilient fetch primitives — bounded retries + per-process circuit breaker.
+// Test-only helpers (`__resetBreakerRegistry__`, `classifyOutcome`) are
+// reachable via the separate `gitnexus-shared/test-helpers` subpath; do
+// NOT add them here. Production consumers must not call them.
+export { withRetry, computeBackoffMs } from './integrations/retry.js';
+export type { RetryOptions, RetryDecision } from './integrations/retry.js';
+export { CircuitBreaker, CircuitOpenError, getBreaker } from './integrations/circuit-breaker.js';
+export type { CircuitBreakerOptions } from './integrations/circuit-breaker.js';
+export {
+  resilientFetch,
+  ResilientFetchExhaustedError,
+  RETRY_AFTER_CAP_MS,
+  parseRetryAfter,
+} from './integrations/resilient-fetch.js';
+export type { ResilientFetchOptions } from './integrations/resilient-fetch.js';
+
+// Understand-Quickly registry integration (opt-in)
+export {
+  UNDERSTAND_QUICKLY_DISPATCH_URL,
+  UNDERSTAND_QUICKLY_EVENT_TYPE,
+  UNDERSTAND_QUICKLY_TOKEN_ENV,
+  buildUqDispatchPayload,
+  isValidOwnerRepo,
+  parseOwnerRepoFromRemote,
+  stripGitSuffix,
+} from './integrations/understand-quickly.js';
+export type { UqDispatchPayload } from './integrations/understand-quickly.js';
 
 // Shadow-mode diff + aggregation (RFC §6.3; Ring 2 SHARED #918)
 export { diffResolutions } from './scope-resolution/shadow/diff.js';

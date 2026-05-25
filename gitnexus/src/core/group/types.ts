@@ -1,4 +1,4 @@
-export type ContractType = 'http' | 'grpc' | 'topic' | 'lib' | 'custom';
+export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custom' | 'include';
 export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
@@ -24,9 +24,12 @@ export interface GroupManifestLink {
 export interface DetectConfig {
   http: boolean;
   grpc: boolean;
+  thrift: boolean;
   topics: boolean;
   shared_libs: boolean;
   embedding_fallback: boolean;
+  includes: boolean;
+  workspace_deps: boolean;
 }
 
 export interface MatchingConfig {

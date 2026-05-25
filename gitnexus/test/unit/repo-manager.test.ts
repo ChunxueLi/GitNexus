@@ -4,10 +4,11 @@
  * Tests: getStoragePath, getStoragePaths, readRegistry, registerRepo, unregisterRepo
  * Covers hardening fixes #29 (API key file permissions) and #30 (case-insensitive paths on Windows)
  */
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import path from 'path';
 import os from 'os';
 import fs from 'fs/promises';
+import { _captureLogger } from '../../src/core/logger.js';
 import {
   getStoragePath,
   getStoragePaths,
@@ -73,6 +74,7 @@ describe('ensureGitNexusIgnored (#1233)', () => {
   });
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     await tmpRepo.cleanup();
   });
 
@@ -139,6 +141,74 @@ describe('ensureGitNexusIgnored (#1233)', () => {
     });
     expect(status).toBe('');
   });
+
+  // ─ Read-only workspace tolerance (#1549) ────────────────────────────
+  // The documented Docker workflow mounts the host workspace at /workspace:ro
+  // and runs `gitnexus index /workspace/<repo>`. The host has already created
+  // the .gitnexus dir during a prior `analyze`, so the gitignore file already
+  // exists with the correct content — there's no real work to do. The tests
+  // below pin two pieces of behaviour that make that workflow work:
+  //   (a) the function short-circuits when the file is already correct
+  //       (no write attempt, no mtime bump);
+  //   (b) when a write *is* needed but the FS is not writable
+  //       (EROFS / EACCES / EPERM), the function logs and continues instead of
+  //       throwing — so the caller's `registerRepo` work stays committed.
+
+  it('does not re-write .gitnexus/.gitignore when it already has the desired content', async () => {
+    await ensureGitNexusIgnored(tmpRepo.dbPath);
+    const gitignorePath = path.join(tmpRepo.dbPath, '.gitnexus', '.gitignore');
+    const before = await fs.stat(gitignorePath);
+
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    await ensureGitNexusIgnored(tmpRepo.dbPath);
+
+    const after = await fs.stat(gitignorePath);
+    expect(after.mtimeMs).toBe(before.mtimeMs);
+  });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'does not throw when .gitnexus/.gitignore is already correct and the storage dir is read-only',
+    async () => {
+      await ensureGitNexusIgnored(tmpRepo.dbPath);
+      const storagePath = path.join(tmpRepo.dbPath, '.gitnexus');
+
+      await fs.chmod(storagePath, 0o555);
+      try {
+        await expect(ensureGitNexusIgnored(tmpRepo.dbPath)).resolves.not.toThrow();
+      } finally {
+        await fs.chmod(storagePath, 0o755);
+      }
+    },
+  );
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'warns and continues when the storage dir is read-only and the file does not yet exist',
+    async () => {
+      const storagePath = path.join(tmpRepo.dbPath, '.gitnexus');
+      await fs.mkdir(storagePath, { recursive: true });
+      await fs.chmod(storagePath, 0o555);
+
+      const cap = _captureLogger();
+      try {
+        await expect(ensureGitNexusIgnored(tmpRepo.dbPath)).resolves.not.toThrow();
+        expect(
+          cap
+            .records()
+            .some(
+              (r) =>
+                r.level === 40 &&
+                (r.code === 'EACCES' || r.code === 'EPERM') &&
+                String(r.msg ?? '').includes('.gitnexus/.gitignore') &&
+                String(r.path ?? '').includes('.gitnexus'),
+            ),
+        ).toBe(true);
+      } finally {
+        cap.restore();
+        await fs.chmod(storagePath, 0o755);
+      }
+    },
+  );
 });
 
 // ─── readRegistry ────────────────────────────────────────────────────
@@ -868,5 +938,171 @@ describe('assertSafeStoragePath (#1003)', () => {
     };
     // Should accept because Windows paths are case-insensitive.
     expect(() => assertSafeStoragePath(entry)).not.toThrow();
+  });
+});
+
+// ─── Worktree-aware registry-name fallback (#1259) ─────────────────────
+//
+// The first @claude review on PR #1296 caught a critical gap: my initial
+// fix only patched the early-return path in `runFullAnalysis`, leaving
+// the full-analysis path (which calls `registerRepo` directly) still
+// using the worktree-slug basename when no `--name` and no remote are
+// configured. This block proves `registerRepo`'s OWN basename fallback
+// now uses the canonical repo root via `getCanonicalRepoRoot` — the
+// regression-guard for the wiring at the registry layer, complementing
+// the helper-level coverage in `git-utils.test.ts`.
+
+describe('registerRepo worktree-aware basename fallback (#1259)', () => {
+  let tmpHome: Awaited<ReturnType<typeof createTempDir>>;
+  let tmpRepo: Awaited<ReturnType<typeof createTempDir>>;
+  let savedGitnexusHome: string | undefined;
+
+  const meta: RepoMeta = {
+    repoPath: '',
+    lastCommit: 'abc1234',
+    indexedAt: '2026-05-03T00:00:00.000Z',
+    stats: { files: 1, nodes: 1 },
+  };
+
+  beforeEach(async () => {
+    tmpHome = await createTempDir('gitnexus-registry-home-');
+    tmpRepo = await createTempDir('gitnexus-canonical-repo-');
+    savedGitnexusHome = process.env.GITNEXUS_HOME;
+    process.env.GITNEXUS_HOME = tmpHome.dbPath;
+  });
+
+  afterEach(async () => {
+    if (savedGitnexusHome === undefined) delete process.env.GITNEXUS_HOME;
+    else process.env.GITNEXUS_HOME = savedGitnexusHome;
+    await tmpHome.cleanup();
+    await tmpRepo.cleanup();
+  });
+
+  it('registerRepo from a linked worktree uses canonical repo basename, not worktree slug', async () => {
+    // Set up a real git repo with at least one commit (worktree add requires
+    // a non-empty branch). No remote is configured — that's the trigger for
+    // the basename fallback this test guards.
+    execSync('git init -q', { cwd: tmpRepo.dbPath });
+    execSync('git config user.email "test@example.com"', { cwd: tmpRepo.dbPath });
+    execSync('git config user.name "Test"', { cwd: tmpRepo.dbPath });
+    execSync('git commit --allow-empty -q -m "initial"', { cwd: tmpRepo.dbPath });
+
+    const worktreeDir = path.join(tmpRepo.dbPath, 'wt-feature');
+    execSync(`git worktree add -q -b feature "${worktreeDir}"`, { cwd: tmpRepo.dbPath });
+
+    try {
+      // Call registerRepo with the WORKTREE path and NO --name. Pre-fix this
+      // would register under the worktree's basename ("wt-feature"). The
+      // canonical-root fallback in registerRepo now resolves it to the
+      // canonical repo's basename (whatever `tmpRepo`'s temp-dir basename
+      // happens to be).
+      await registerRepo(worktreeDir, meta);
+
+      const entries = await listRegisteredRepos();
+      expect(entries).toHaveLength(1);
+      // The registered name MUST NOT be the worktree slug.
+      expect(entries[0].name).not.toBe('wt-feature');
+      // It MUST match the canonical repo dir's basename. We compare via
+      // basename (not full-path equality) for the same Windows 8.3
+      // short-name reason as the `getCanonicalRepoRoot` helper tests:
+      // git and `fs.realpathSync` may resolve to different long/short
+      // forms of the same path on Windows runners, but both have the
+      // same `basename`.
+      expect(entries[0].name).toBe(path.basename(tmpRepo.dbPath));
+    } finally {
+      // Best-effort worktree teardown before the temp-dir cleanup runs.
+      try {
+        execSync(`git worktree remove -f "${worktreeDir}"`, { cwd: tmpRepo.dbPath });
+      } catch {
+        // Falls through to recursive rm in afterEach.
+      }
+    }
+  });
+
+  // Pinned by the second @claude review on PR #1296: the FIRST review-fix
+  // commit (`7ceb839b`) introduced a regression in `hasCustomAlias`. Once
+  // a worktree is registered with the canonical basename
+  // (`{name: 'repo', path: '/repo/wt-feature'}`), `hasCustomAlias` saw
+  // `'repo' !== path.basename('/repo/wt-feature') = 'wt-feature'` and
+  // wrongly classified the canonical-root name as a sticky user alias.
+  // On re-analyze the duplicate-name guard then fired against the
+  // canonical checkout's entry → `RegistryNameCollisionError` blocking
+  // the primary "per-task worktree, repeated re-analyze" workflow this
+  // PR is supposed to FIX. This test exercises the full sequence:
+  // canonical → worktree → re-worktree, with both paths registered.
+  it('canonical → worktree → re-worktree re-register does not throw collision (#1259 hasCustomAlias regression)', async () => {
+    execSync('git init -q', { cwd: tmpRepo.dbPath });
+    execSync('git config user.email "test@example.com"', { cwd: tmpRepo.dbPath });
+    execSync('git config user.name "Test"', { cwd: tmpRepo.dbPath });
+    execSync('git commit --allow-empty -q -m "initial"', { cwd: tmpRepo.dbPath });
+
+    const worktreeDir = path.join(tmpRepo.dbPath, 'wt-feature');
+    execSync(`git worktree add -q -b feature "${worktreeDir}"`, { cwd: tmpRepo.dbPath });
+
+    try {
+      // 1. Register the canonical checkout — gets the canonical basename.
+      await registerRepo(tmpRepo.dbPath, meta);
+      // 2. Register the worktree — gets the SAME canonical basename
+      //    (because of the `resolveRepoIdentityRoot` fix). Two entries
+      //    coexist with the same name but different paths; this is the
+      //    documented "silent basename collision" behavior, not an error.
+      await registerRepo(worktreeDir, meta);
+      // 3. Re-register the worktree. Pre-`hasCustomAlias`-fix this threw
+      //    `RegistryNameCollisionError` because the existing worktree
+      //    entry (`{name: 'repo', path: worktreeDir}`) was misclassified
+      //    as a custom alias by `hasCustomAlias`, fired the guard
+      //    against the canonical entry. With the fix it must complete
+      //    without throwing.
+      await expect(registerRepo(worktreeDir, meta)).resolves.toBeDefined();
+
+      // Both registry entries should still be present and named
+      // canonically.
+      const entries = await listRegisteredRepos();
+      expect(entries).toHaveLength(2);
+      const canonicalBasename = path.basename(tmpRepo.dbPath);
+      for (const entry of entries) {
+        expect(entry.name).toBe(canonicalBasename);
+      }
+    } finally {
+      try {
+        execSync(`git worktree remove -f "${worktreeDir}"`, { cwd: tmpRepo.dbPath });
+      } catch {
+        // Falls through to recursive rm in afterEach.
+      }
+    }
+  });
+
+  // Pinned by the third @claude review on PR #1296 (MEDIUM #2): the
+  // `hasGitDir` gate inside `resolveRepoIdentityRoot` is the safeguard
+  // that keeps the #1232/#1233 `--skip-git` behaviour working — an
+  // arbitrary subdir under a parent git repo (no `.git` of its own)
+  // must NOT collapse to the parent's canonical root, otherwise users
+  // who analyze a subdir get the parent repo's basename in the
+  // registry. The COOLIO `--skip-git` integration test in
+  // `skip-git-cli.test.ts` already proves this end-to-end, but no
+  // direct test sat at the `registerRepo` layer to guard the gate
+  // against future refactors. This is that direct test.
+  it('registerRepo on an arbitrary subdir under a git repo preserves the subdir basename (#1232 / #1233 gate)', async () => {
+    execSync('git init -q', { cwd: tmpRepo.dbPath });
+    execSync('git config user.email "test@example.com"', { cwd: tmpRepo.dbPath });
+    execSync('git config user.name "Test"', { cwd: tmpRepo.dbPath });
+    execSync('git commit --allow-empty -q -m "initial"', { cwd: tmpRepo.dbPath });
+
+    // A subdir of the canonical checkout, NOT a worktree (no `.git` file
+    // here — `mkdirSync` only). `resolveRepoIdentityRoot` must keep
+    // returning this exact path (basename used for the registry name)
+    // rather than collapsing to the parent repo's canonical root.
+    const subdir = path.join(tmpRepo.dbPath, 'arbitrary-subdir');
+    await fs.mkdir(subdir, { recursive: true });
+
+    await registerRepo(subdir, meta);
+
+    const entries = await listRegisteredRepos();
+    expect(entries).toHaveLength(1);
+    // Registered name must be the SUBDIR's basename, NOT the parent
+    // canonical repo's basename — the inverse of what worktree
+    // collapse does.
+    expect(entries[0].name).toBe('arbitrary-subdir');
+    expect(entries[0].name).not.toBe(path.basename(tmpRepo.dbPath));
   });
 });

@@ -78,6 +78,14 @@ export type ImportSemantics =
   | 'namespace'
   | 'explicit-reexport';
 
+/** Configuration for AST-based framework detection patterns. */
+export interface AstFrameworkPatternConfig {
+  framework: string;
+  entryPointMultiplier: number;
+  reason: string;
+  patterns: string[];
+}
+
 /**
  * Everything a language needs to provide.
  * Required fields must be explicitly set; optional fields have defaults
@@ -89,6 +97,16 @@ interface LanguageProviderConfig {
   /** File extensions that map to this language (e.g., ['.ts', '.tsx']) */
   readonly extensions: readonly string[];
 
+  /** Entry-point function name patterns specific to this language.
+   *  Merged with universal patterns at runtime for process detection scoring.
+   *  Default: [] (only universal patterns apply). */
+  readonly entryPointPatterns?: readonly RegExp[];
+
+  /** AST-based framework detection patterns for this language.
+   *  Used by detectFrameworkFromAST to identify framework entry points.
+   *  Default: [] (no AST framework detection for this language). */
+  readonly astFrameworkPatterns?: readonly AstFrameworkPatternConfig[];
+
   // ── Parser ────────────────────────────────────────────────────────
   /** Parse strategy: 'tree-sitter' (default) uses AST parsing via tree-sitter.
    *  'standalone' means the language has its own regex-based processor and
@@ -97,6 +115,39 @@ interface LanguageProviderConfig {
   /** Tree-sitter query strings for definitions, imports, calls, heritage.
    *  Required for tree-sitter languages; empty string for standalone processors. */
   readonly treeSitterQueries: string;
+
+  /**
+   * Optional source-text transform that runs **before** tree-sitter parses the file.
+   *
+   * Used to elide language constructs that confuse the grammar without affecting
+   * source-position fidelity — e.g., Unreal Engine reflection macros (`UCLASS`,
+   * `UFUNCTION`, `MODULENAME_API`) in C++ headers that prevent the parser from
+   * recognising class/function names correctly.
+   *
+   * **Length / position preservation:** the returned string MUST have the same
+   * JavaScript `.length` as the input AND preserve every newline (`\n`/`\r`)
+   * position byte-for-byte. Implementations replace elided characters with
+   * ASCII spaces while leaving newlines untouched. With this contract:
+   *
+   *   - tree-sitter's reported `startPosition.row`/`startPosition.column`
+   *     match the original file exactly (line/column come from newline counts)
+   *   - `startIndex`/`endIndex` byte offsets match the original file exactly
+   *     **when the elided range is pure ASCII** (UTF-16 `.length` equals UTF-8
+   *     byte length only for ASCII).
+   *
+   * Implementations targeting languages where elided ranges may contain
+   * non-ASCII content must therefore preserve byte length, not just `.length`,
+   * if downstream code uses `startIndex` to slice the original UTF-8 bytes.
+   * The current C++ UE-macro preprocessor relies on the practical fact that
+   * UE reflection macros and module-export tokens are ASCII-only.
+   *
+   * Must be a pure function — same input always yields the same output. Called
+   * once per file, on every code path that re-parses (parsing-processor, import
+   * processor, heritage processor, call processor, parse worker).
+   *
+   * Default: undefined (no preprocessing — `file.content` is parsed verbatim).
+   */
+  readonly preprocessSource?: (sourceText: string, filePath: string) => string;
 
   // ── Core (required) ───────────────────────────────────────────────
   /** Type extraction: declarations, initializers, for-loop bindings */
@@ -158,6 +209,37 @@ interface LanguageProviderConfig {
   readonly enclosingFunctionFinder?: (
     ancestorNode: SyntaxNode,
   ) => { funcName: string; label: NodeLabel } | null;
+
+  // ── Template constraint extraction (SFINAE / `requires`) ────────────
+  /**
+   * Extract a per-language template-constraint payload for a templated
+   * function / method definition. Used by `parsing-processor` to
+   * disambiguate same-name same-arity overloads whose distinguishing
+   * signal is their template constraints rather than their parameter
+   * types — the canonical C++ SFINAE case (issue #1579):
+   *
+   *   template<class T, std::enable_if_t<is_integral_v<T>, int> = 0>
+   *   void process(T);   // overload A
+   *
+   *   template<class T, std::enable_if_t<is_floating_point_v<T>, int> = 0>
+   *   void process(T);   // overload B
+   *
+   * Both overloads' `parameterTypes` collapse to `['T']`, so without a
+   * constraint fingerprint in the graph node ID they merge into one
+   * Function node and the resolver only ever sees one candidate to
+   * narrow. The hook's return value is stamped onto the node's ID via
+   * `templateConstraintsIdTag()` AND stored on the node's
+   * `templateConstraints` property so `resolveDefGraphId` can look up
+   * the right overload by re-hashing the def's constraints at resolve
+   * time.
+   *
+   * Returns the opaque payload (any JSON-serializable shape — the
+   * producing adapter owns it; shared code MUST NOT inspect) or
+   * `undefined` when no constraints exist / the node isn't a templated
+   * function. Languages without SFINAE / concept semantics leave this
+   * undefined and the disambiguation is a pass-through.
+   */
+  readonly extractTemplateConstraints?: (definitionNode: SyntaxNode) => unknown;
 
   // ── Labels ────────────────────────────────────────────────────────
   /** Override the default node label for definition.function captures.

@@ -6,7 +6,11 @@ import path from 'path';
 
 export const isGitRepo = (repoPath: string): boolean => {
   try {
-    execSync('git rev-parse --is-inside-work-tree', { cwd: repoPath, stdio: 'ignore' });
+    execSync('git rev-parse --is-inside-work-tree', {
+      cwd: repoPath,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
     return true;
   } catch {
     return false;
@@ -15,7 +19,18 @@ export const isGitRepo = (repoPath: string): boolean => {
 
 export const getCurrentCommit = (repoPath: string): string => {
   try {
-    return execSync('git rev-parse HEAD', { cwd: repoPath }).toString().trim();
+    return execSync('git rev-parse HEAD', {
+      cwd: repoPath,
+      // Suppress stderr -- without an explicit stdio option, Node's execSync
+      // forwards the child's stderr to the parent process (documented behaviour).
+      // When repoPath is not inside a git worktree, git prints
+      // "fatal: not a git repository" to stderr, which leaks to the user's
+      // terminal even though the error is caught here (#1172).
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+      .toString()
+      .trim();
   } catch {
     return '';
   }
@@ -50,6 +65,7 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
     raw = execSync('git config --get remote.origin.url', {
       cwd: repoPath,
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     })
       .toString()
       .trim();
@@ -86,11 +102,121 @@ export const getRemoteUrl = (repoPath: string): string | undefined => {
  */
 export const getGitRoot = (fromPath: string): string | null => {
   try {
-    const raw = execSync('git rev-parse --show-toplevel', { cwd: fromPath }).toString().trim();
+    const raw = execSync('git rev-parse --show-toplevel', {
+      cwd: fromPath,
+      // Suppress stderr -- see getCurrentCommit comment and #1172.
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+      .toString()
+      .trim();
     // On Windows, git returns /d/Projects/Foo — path.resolve normalizes to D:\Projects\Foo
     return path.resolve(raw);
   } catch {
     return null;
+  }
+};
+
+/**
+ * Get the *canonical* repository root, dereferencing git worktrees.
+ *
+ * Unlike `getGitRoot` (which uses `git rev-parse --show-toplevel` and
+ * returns the WORKTREE's root when called inside a linked worktree),
+ * this uses `git rev-parse --git-common-dir` — the shared `.git`
+ * directory, identical for the main checkout and every linked
+ * worktree — and returns its parent.
+ *
+ * Why it matters (#1259): when `gitnexus analyze` runs inside a
+ * worktree (e.g. `/repo/wt-feature/`), deriving `repoName` from
+ * `path.basename(getGitRoot(cwd))` registers the project under the
+ * worktree's directory slug (`wt-feature`) instead of the canonical
+ * repo's basename (`repo`). Each worktree then re-registers as a
+ * "different" project, AGENTS.md is rewritten with the wrong MCP URI,
+ * and Claude-Code-style worktree workflows silently accumulate
+ * duplicate registry entries.
+ *
+ * Returns `null` when the path is not inside a git repository or
+ * `git` is not available, so callers can chain safely:
+ * `getCanonicalRepoRoot(p) ?? getGitRoot(p) ?? p`.
+ *
+ * `--path-format=absolute` is required because `--git-common-dir`
+ * returns a path *relative to cwd* by default (e.g. `../.git` when
+ * called from a worktree), which would resolve to the wrong absolute
+ * path if the caller later resolved it from a different directory.
+ */
+export const getCanonicalRepoRoot = (fromPath: string): string | null => {
+  try {
+    const commonDir = execSync('git rev-parse --path-format=absolute --git-common-dir', {
+      cwd: fromPath,
+      stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
+    })
+      .toString()
+      .trim();
+    if (!commonDir) return null;
+    // Common dir is `<repo>/.git` for both the main checkout and all
+    // linked worktrees. Its parent is the canonical repo root.
+    return path.dirname(path.resolve(commonDir));
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Resolve `fromPath` to the directory whose basename should drive the
+ * registry name (#1259) — the *identity root*. Three outcomes:
+ *
+ *   1. `fromPath` IS the canonical checkout root → returns it unchanged.
+ *   2. `fromPath` is a linked-worktree root (has its own `.git` entry, but
+ *      `git rev-parse --git-common-dir` points at a different `.git`) →
+ *      returns the canonical repo root.
+ *   3. `fromPath` is anything else — an arbitrary subdir under a git repo,
+ *      a non-git folder, a `--skip-git` subdir of an unrelated parent
+ *      checkout — returns `fromPath` unchanged.
+ *
+ * Why not just use `getCanonicalRepoRoot` directly? Because `git rev-parse
+ * --git-common-dir` resolves the same canonical root for ANY path inside
+ * a git repo, including unrelated subdirs. Using it for registry-name
+ * derivation would silently re-key a `--skip-git` subdir analyze under
+ * the parent git's basename, defeating the user's `--skip-git` intent
+ * (regressing the #1232/#1233 fix). The "is this path a tree root"
+ * gate confines the canonical-root collapse to exactly the cases where
+ * #1259 matters: main checkouts and linked worktrees.
+ */
+export const resolveRepoIdentityRoot = (fromPath: string): string => {
+  const resolved = path.resolve(fromPath);
+  const canonical = getCanonicalRepoRoot(resolved);
+  if (!canonical) return resolved; // non-git → use as-is
+  if (canonical === resolved) return canonical; // canonical checkout
+  if (hasGitDir(resolved)) return canonical; // linked worktree (has .git file)
+  return resolved; // arbitrary subdir under a git repo → preserve as-is
+};
+
+/**
+ * Find a git root by checking only `.git` entries on the ancestor chain.
+ *
+ * Unlike `getGitRoot`, this does not spawn `git`, so MCP can cheaply decide
+ * whether a launch cwd is a worktree before running any subprocess there.
+ */
+export const findGitRootByDotGit = (fromPath: string): string | null => {
+  let current = path.resolve(fromPath);
+  try {
+    if (!statSync(current).isDirectory()) {
+      current = path.dirname(current);
+    }
+  } catch {
+    return null;
+  }
+
+  while (true) {
+    try {
+      statSync(path.join(current, '.git'));
+      return current;
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      current = parent;
+    }
   }
 };
 /**
@@ -127,6 +253,7 @@ export const getRemoteOriginUrl = (repoPath: string): string | null => {
     const url = execSync('git config --get remote.origin.url', {
       cwd: repoPath,
       stdio: ['ignore', 'pipe', 'ignore'],
+      windowsHide: true,
     })
       .toString()
       .trim();
@@ -137,24 +264,63 @@ export const getRemoteOriginUrl = (repoPath: string): string | null => {
 };
 
 /**
- * Parse a repository name out of a git remote URL. Handles the common
- * SSH (`git@host:owner/repo.git`), HTTPS (`https://host/owner/repo.git`),
- * `git://`, `ssh://`, and `file://` shapes. Returns `null` for empty /
- * unparseable input.
+ * Sanitize a repository name to prevent argument injection and ensure
+ * cross-platform filesystem compatibility.
  *
- * The heuristic: strip a trailing `.git` and trailing slashes, then
- * take the segment after the last `/` or `:`.
+ * 1. Strips leading dashes to prevent git command-line argument injection
+ *    (e.g., --upload-pack=evil).
+ * 2. Replaces characters that are unsafe for directory names across
+ *    platforms (Windows/macOS/Linux) with underscores.
+ * 3. Blocks path traversal segments ("." and "..") and Windows reserved
+ *    names (e.g., CON, NUL) to prevent directory escape.
+ */
+export const sanitizeRepoName = (name: string): string => {
+  // 1. Prevent argument injection by stripping leading dashes.
+  // 2. Remove characters that are not alphanumerics, dots, underscores, or dashes.
+  const sanitized = name.replace(/^-+/, '').replace(/[^a-zA-Z0-9._-]/g, '_');
+
+  // 3. Block path traversal segments and Windows reserved names.
+  // Windows reserved names like CON, PRN, AUX, NUL, COM1-9, LPT1-9 cannot
+  // be used as directory names on Windows even if they have an extension.
+  const reserved = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\..*)?$/i;
+  if (!sanitized || sanitized === '.' || sanitized === '..' || reserved.test(sanitized)) {
+    return 'unknown';
+  }
+
+  return sanitized;
+};
+
+/**
+ * Parse a repository name out of a git remote URL. Handles common shapes
+ * including SSH (git@host:owner/repo.git) and HTTPS (https://host/owner/repo.git).
+ *
+ * Returns a sanitized, filesystem-safe name or null if no name could be inferred.
+ * Returning null (rather than 'unknown') allows callers to use ?? null-coalescing
+ * for fallbacks without risk of registry collisions on 'unknown'.
  */
 export const parseRepoNameFromUrl = (url: string | null | undefined): string | null => {
   if (!url) return null;
   const trimmed = url.trim();
   if (!trimmed) return null;
-  // Strip `.git` suffix (case-insensitive) and any trailing slashes.
-  const withoutSuffix = trimmed.replace(/\.git\/*$/i, '').replace(/\/+$/, '');
-  // Last path segment, splitting on either `/` or `:` (covers SSH form).
-  const m = withoutSuffix.match(/[/:]([^/:]+)$/);
-  const candidate = m ? m[1] : withoutSuffix;
-  return candidate || null;
+
+  // Strip trailing slashes without a regex to avoid polynomial-ReDoS on
+  // pathological inputs like `https://x.com/y` + '/'.repeat(1e6).
+  let end = trimmed.length;
+  while (end > 0 && trimmed.charCodeAt(end - 1) === 47 /* '/' */) end--;
+  let cleaned = trimmed.slice(0, end);
+
+  // Strip trailing .git (case-insensitive)
+  if (cleaned.toLowerCase().endsWith('.git')) {
+    cleaned = cleaned.slice(0, -4);
+  }
+
+  // Last path segment, handling colons for SSH URLs and path traversal.
+  // Split on both / and : to consistently extract the last part.
+  const candidate = cleaned.split(/[/:]/).pop() || '';
+  if (!candidate) return null;
+
+  const safe = sanitizeRepoName(candidate);
+  return safe === 'unknown' ? null : safe;
 };
 
 /**

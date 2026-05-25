@@ -15,27 +15,32 @@ export interface BM25SearchResult {
   nodeIds?: string[];
 }
 
+export interface FTSSearchResponse {
+  results: BM25SearchResult[];
+  /** True when at least one FTS index query succeeded (index exists). */
+  ftsAvailable: boolean;
+}
+
 /**
  * Execute a single FTS query via a custom executor (for MCP connection pool).
- * Returns the same shape as core queryFTS (from LadybugDB adapter).
+ * Returns `null` when the query fails (e.g. FTS index does not exist) so the
+ * caller can distinguish "zero matches" from "index missing".
  */
 async function queryFTSViaExecutor(
-  executor: (cypher: string) => Promise<any[]>,
+  executor: (cypher: string, params: Record<string, any>) => Promise<any[]>,
   tableName: string,
   indexName: string,
   query: string,
   limit: number,
-): Promise<Array<{ filePath: string; score: number; nodeId: string }>> {
-  // Escape single quotes and backslashes to prevent Cypher injection
-  const escapedQuery = query.replace(/\\/g, '\\\\').replace(/'/g, "''");
+): Promise<Array<{ filePath: string; score: number; nodeId: string }> | null> {
   const cypher = `
-    CALL QUERY_FTS_INDEX('${tableName}', '${indexName}', '${escapedQuery}', conjunctive := false)
+    CALL QUERY_FTS_INDEX('${tableName}', '${indexName}', $query, conjunctive := false)
     RETURN node, score
     ORDER BY score DESC
     LIMIT ${limit}
   `;
   try {
-    const rows = await executor(cypher);
+    const rows = await executor(cypher, { query });
     return rows.map((row: any) => {
       const node = row.node || row[0] || {};
       const score = row.score ?? row[1] ?? 0;
@@ -46,7 +51,7 @@ async function queryFTSViaExecutor(
       };
     });
   } catch {
-    return [];
+    return null;
   }
 }
 
@@ -65,26 +70,40 @@ export const searchFTSFromLbug = async (
   query: string,
   limit: number = 20,
   repoId?: string,
-): Promise<BM25SearchResult[]> => {
+): Promise<FTSSearchResponse> => {
   const resultsByIndex: any[][] = [];
+  let queriesSucceeded = 0;
 
   if (repoId) {
     // Use MCP connection pool via dynamic import
     // IMPORTANT: FTS queries run sequentially to avoid connection contention.
     // The MCP pool supports multiple connections, but FTS is best run serially.
     const poolMod = await import('../lbug/pool-adapter.js');
-    const { executeQuery } = poolMod;
-    const executor = (cypher: string) => executeQuery(repoId, cypher);
+    const { executeParameterized } = poolMod;
+    const executor = (cypher: string, params: Record<string, any>) =>
+      executeParameterized(repoId, cypher, params);
 
     for (const { table, indexName } of FTS_INDEXES) {
-      resultsByIndex.push(await queryFTSViaExecutor(executor, table, indexName, query, limit));
+      const result = await queryFTSViaExecutor(executor, table, indexName, query, limit);
+      if (result !== null) {
+        queriesSucceeded++;
+        resultsByIndex.push(result);
+      }
     }
   } else {
     // Use core lbug adapter (CLI / pipeline context) — also sequential for safety.
     for (const { table, indexName } of FTS_INDEXES) {
-      resultsByIndex.push(await queryFTS(table, indexName, query, limit, false).catch(() => []));
+      try {
+        const result = await queryFTS(table, indexName, query, limit, false);
+        queriesSucceeded++;
+        resultsByIndex.push(result);
+      } catch {
+        // FTS index may not exist — count as failed
+      }
     }
   }
+
+  const ftsAvailable = queriesSucceeded > 0;
 
   // Collect all node scores per filePath to track which nodes actually matched
   const fileNodeScores = new Map<string, Array<{ score: number; nodeId: string }>>();
@@ -116,10 +135,13 @@ export const searchFTSFromLbug = async (
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
 
-  return sorted.map((r, index) => ({
-    filePath: r.filePath,
-    score: r.score,
-    rank: index + 1,
-    nodeIds: r.nodeIds,
-  }));
+  return {
+    results: sorted.map((r, index) => ({
+      filePath: r.filePath,
+      score: r.score,
+      rank: index + 1,
+      nodeIds: r.nodeIds,
+    })),
+    ftsAvailable,
+  };
 };

@@ -19,21 +19,23 @@ import {
   executePrepared,
   executeWithReusedStatement,
   streamQuery,
+  flushWAL,
   closeLbug,
   withLbugDb,
+  isReadOnlyDbError,
 } from '../core/lbug/lbug-adapter.js';
-import { isWriteQuery } from '../core/lbug/pool-adapter.js';
+import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
-// Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
-// at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { JobManager } from './analyze-job.js';
+import { assertString, escapeRegExp, BadRequestError, createRouteLimiter } from './validation.js';
 import { extractRepoName, getCloneDir, cloneOrPull } from './git-clone.js';
+import { logger, flushLoggerSync } from '../core/logger.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -141,7 +143,7 @@ export const resolveWebDistDir = async (
       return dir;
     } catch (err: any) {
       if (err?.code !== 'ENOENT') {
-        console.warn(`[serve] could not access web UI dir ${dir}:`, err.message);
+        logger.warn({ err: err.message }, `[serve] could not access web UI dir ${dir}:`);
       }
     }
   }
@@ -182,6 +184,7 @@ a.ext:hover{text-decoration:underline}
   <div class="section-title">Endpoints</div>
   <p class="endpoint"><a href="/api/info">/api/info</a> <span style="color:#5a5a70">— Server version &amp; context</span></p>
   <p class="endpoint"><a href="/api/repos">/api/repos</a> <span style="color:#5a5a70">— Indexed repositories</span></p>
+  <p class="endpoint"><code>/api/health</code> <span style="color:#5a5a70">— Docker/orchestrator healthcheck</span></p>
   <p class="endpoint"><code>/api/heartbeat</code> <span style="color:#5a5a70">— SSE heartbeat</span></p>
   <p class="endpoint"><code>/api/graph</code> <code>/api/query</code> <code>/api/search</code> <span style="color:#5a5a70">— Data</span></p>
   <p class="endpoint"><code>/api/mcp</code> <span style="color:#5a5a70">— MCP over StreamableHTTP</span></p>
@@ -216,7 +219,19 @@ export const registerWebUI = (app: express.Express, staticDir: string | null): v
     // The regex excludes /api paths AND paths with file extensions (.js, .css, etc.)
     // so missing assets get real 404s instead of the SPA HTML.
     // Adding routes below this will be unreachable for non-API, non-asset paths.
-    app.get(SPA_FALLBACK_REGEX, (_req, res) => {
+    // Rate-limited (CodeQL js/missing-rate-limiting): the SPA fallback
+    // serves a constant index.html, but the FS access from a route handler
+    // is enough to trip the analyzer. The limit is generous (300 rpm/IP =
+    // 5 req/s sustained) so that multi-tab browser navigation, prefetch,
+    // and service-worker revalidation do not produce 429s for legitimate
+    // SPA users. At this rate, real browser navigation is extremely
+    // unlikely to hit the limit in practice, so the cosmetic issue of
+    // JSON-on-429 to a browser is a low-likelihood path. Content
+    // negotiation on the 429 (returning the SPA shell to HTML clients
+    // instead of `{ error: '...' }`) would require swapping
+    // express-rate-limit's `message` for a `handler` function and is
+    // deferred to keep this PR focused on closing the CodeQL alert.
+    app.get(SPA_FALLBACK_REGEX, createRouteLimiter({ limit: 300 }), (_req, res) => {
       res.sendFile(path.join(staticDir, 'index.html'));
     });
   } else {
@@ -433,7 +448,14 @@ export const streamGraphNdjson = async (
  */
 const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManager) => {
   app.get(routePath, (req, res) => {
-    const job = jm.getJob(req.params.jobId);
+    let jobId: string;
+    try {
+      jobId = assertString(req.params.jobId, 'jobId');
+    } catch (err: any) {
+      res.status(err.status ?? 400).json({ error: err.message });
+      return;
+    }
+    const job = jm.getJob(jobId);
     if (!job) {
       res.status(404).json({ error: 'Job not found' });
       return;
@@ -479,7 +501,7 @@ const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManage
       try {
         eventId++;
         if (progress.phase === 'complete' || progress.phase === 'failed') {
-          const eventJob = jm.getJob(req.params.jobId);
+          const eventJob = jm.getJob(jobId);
           res.write(
             `id: ${eventId}\nevent: ${progress.phase}\ndata: ${JSON.stringify({
               repoName: eventJob?.repoName,
@@ -506,6 +528,9 @@ const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManage
 };
 
 const statusFromError = (err: any): number => {
+  // Validation helpers throw BadRequestError / ForbiddenError with a typed
+  // .status field — honor it before falling back to message-string matching.
+  if (err instanceof BadRequestError) return err.status;
   const msg = String(err?.message ?? '');
   if (msg.includes('No indexed repositories') || msg.includes('not found')) return 404;
   if (msg.includes('Multiple repositories')) return 400;
@@ -523,9 +548,157 @@ const requestedRepo = (req: express.Request): string | undefined => {
   return undefined;
 };
 
+/**
+ * Handle a GET /api/file request body. Extracted from createServer's route
+ * registration so it can be unit-tested without spinning up an HTTP server
+ * — calling app.get(...) inside a test triggers CodeQL's
+ * js/missing-rate-limiting query, which is appropriate for production
+ * route handlers but a false positive for tests of the handler logic.
+ *
+ * The function takes the express req and res (typed loosely so test code
+ * can pass minimal mocks) plus the resolved repo path. All path-traversal
+ * containment is done inline at the readFile sink with the canonical
+ * path.relative idiom for CodeQL js/path-injection recognition.
+ */
+export const handleFileRequest = async (
+  req: { query: any },
+  res: {
+    status: (code: number) => { json: (body: any) => void };
+    json: (body: any) => void;
+  },
+  repoPath: string,
+): Promise<void> => {
+  try {
+    // Type-confusion guard — req.query.path is `string | string[] | ParsedQs`.
+    // Without this, an attacker could pass `?path=a&path=b` to bypass the
+    // length-bound traversal check below (CodeQL js/type-confusion-through-
+    // parameter-tampering, same class as the /api/grep critical fix).
+    const rawFilePath = req.query.path;
+    if (rawFilePath === undefined || rawFilePath === '') {
+      res.status(400).json({ error: 'Missing path' });
+      return;
+    }
+    const filePath = assertString(rawFilePath, 'path');
+
+    // Path-injection containment — inline at the sink with the canonical
+    // path.relative idiom that CodeQL's js/path-injection sanitizer
+    // recognizes. assertSafePath in validation.ts performs the equivalent
+    // check, but cross-module helpers are not followed by CodeQL's
+    // interprocedural analysis for path-traversal sanitization in JS, so
+    // the barrier must be visible inline at the readFile sink.
+    const repoRoot = path.resolve(repoPath);
+    const fullPath = path.resolve(repoRoot, filePath);
+    const fullRel = path.relative(repoRoot, fullPath);
+    if (fullRel.startsWith('..') || path.isAbsolute(fullRel)) {
+      res.status(403).json({ error: 'Path traversal denied' });
+      return;
+    }
+
+    const raw = await fs.readFile(fullPath, 'utf-8');
+
+    // Optional line-range support: ?startLine=10&endLine=50
+    // Returns only the requested slice (0-indexed), plus metadata.
+    const startLine = req.query.startLine !== undefined ? Number(req.query.startLine) : undefined;
+    const endLine = req.query.endLine !== undefined ? Number(req.query.endLine) : undefined;
+
+    if (startLine !== undefined && Number.isFinite(startLine)) {
+      const lines = raw.split('\n');
+      const start = Math.max(0, startLine);
+      const end =
+        endLine !== undefined && Number.isFinite(endLine)
+          ? Math.min(lines.length, endLine + 1)
+          : lines.length;
+      res.json({
+        content: lines.slice(start, end).join('\n'),
+        startLine: start,
+        endLine: end - 1,
+        totalLines: lines.length,
+      });
+    } else {
+      res.json({ content: raw, totalLines: raw.split('\n').length });
+    }
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      res.status(404).json({ error: 'File not found' });
+    } else {
+      // statusFromError returns err.status for BadRequestError / ForbiddenError
+      // (assertString → 400 on array-form ?path=a&path=b; ForbiddenError → 403
+      // on traversal). Falls back to 500 for unrecognized failures.
+      res.status(statusFromError(err)).json({ error: err.message || 'Failed to read file' });
+    }
+  }
+};
+
+export const handleQueryRequest = async (
+  req: express.Request,
+  res: express.Response,
+  resolveRepo: (repoName?: string) => Promise<{ storagePath: string } | undefined>,
+): Promise<void> => {
+  try {
+    const cypher = req.body.cypher as string;
+    if (!cypher) {
+      res.status(400).json({ error: 'Missing "cypher" in request body' });
+      return;
+    }
+    const queryParams = req.body.params;
+    if (queryParams !== undefined && !isValidQueryParams(queryParams)) {
+      res.status(400).json({
+        error: '"params" must be a plain object with scalar values (string/number/boolean/null)',
+      });
+      return;
+    }
+
+    const entry = await resolveRepo(requestedRepo(req));
+    if (!entry) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    const lbugPath = path.join(entry.storagePath, 'lbug');
+    const result = await withLbugDb(lbugPath, () => executePrepared(cypher, queryParams ?? {}), {
+      readOnly: true,
+    });
+    res.json({ result });
+  } catch (err: any) {
+    if (isReadOnlyDbError(err)) {
+      res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
+      return;
+    }
+    res.status(500).json({ error: err.message || 'Query failed' });
+  }
+};
+
 export const createServer = async (port: number, host: string = '127.0.0.1') => {
   const app = express();
   app.disable('x-powered-by');
+
+  // Trust X-Forwarded-* headers only when the connection comes from the
+  // local loopback or RFC1918 private/link-local addresses — exactly the
+  // origins the CORS allowlist accepts. Without this, every request behind
+  // any reverse proxy / Docker bridge counts as the same `req.ip` and a
+  // single user can trip the per-IP rate limiter for everyone.
+  //
+  // SCOPE: this setting is process-wide. Every middleware and route in this
+  // Express app sees req.ip resolved from X-Forwarded-For when the upstream
+  // hop is in the trusted set above — not just the rate-limited routes.
+  // Future IP-based middleware (audit logging, IP-bound authz) inherits this
+  // behavior.
+  //
+  // CLOUD-DEPLOY CAVEAT: a public cloud LB (AWS ALB, Cloudflare, Fly.io
+  // edge, CGNAT 100.64/10) is NOT in the trusted set. In those topologies
+  // req.ip will collapse to the LB hop IP for every request and the per-IP
+  // rate limiter degrades to per-server. Add an explicit env-var override
+  // and document the cloud-deploy story before binding to a non-loopback
+  // host in those topologies (tracked as a follow-up; not blocking for the
+  // local-bound default).
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+
+  // Chromium Private Network Access (required since Chrome 130+). Must run before
+  // cors: the cors middleware ends OPTIONS preflight responses, so this header
+  // has to be set on res before cors writes the preflight reply.
+  app.use((_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    next();
+  });
 
   // CORS: allow localhost, private/LAN networks, and the deployed site.
   // Non-browser requests (curl, server-to-server) have no origin and are allowed.
@@ -541,21 +714,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   );
   app.use(express.json({ limit: '10mb' }));
 
-  // Support Chromium Private Network Access (required since Chrome 130+).
-  // Without this header, Chrome/Edge/Brave/Arc block public->loopback requests
-  // which breaks bridge mode entirely.
-  app.use((_req, res, next) => {
-    res.setHeader('Access-Control-Allow-Private-Network', 'true');
-    next();
-  });
-
-  // Handle PNA preflight: Chromium sends Access-Control-Request-Private-Network
-  // on OPTIONS requests and expects the allow header in the response.
-  // Note: the actual Allow-Private-Network header is already set by the global
-  // middleware above, so we just need to call next() here.
-  app.options('*', (_req, res, next) => {
-    next();
-  });
+  // No explicit OPTIONS route is registered. The Chromium Private Network
+  // Access header is set by the global middleware above (pre-cors), and
+  // `cors()` itself handles OPTIONS preflights for every path. Registering a
+  // wildcard OPTIONS catchall here would throw under Express 5's stricter
+  // path parser (the source of the original startup crash this branch fixed).
 
   // Initialize MCP backend (multi-repo, shared across all MCP sessions)
   const backend = new LocalBackend();
@@ -625,8 +788,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
         if (isMatch && ['queued', 'cloning', 'analyzing'].includes(job.status)) {
           if (process.env.DEBUG) {
-            console.log(
-              `[debug] resolveRepo waiting for active job ${job.id} (${normalizedName})...`,
+            // Sanitize user-controlled values to prevent log injection (CodeQL js/log-injection).
+            logger.debug(
+              {
+                jobId: String(job.id).replace(/[\r\n]/g, ' '),
+                repoName: String(normalizedName).replace(/[\r\n]/g, ' '),
+              },
+              '[debug] resolveRepo waiting for active job',
             );
           }
           for (let wait = 0; wait < HOLD_QUEUE_TIMEOUT_SECS; wait++) {
@@ -650,7 +818,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     // (e.g. registry file not yet flushed after clone completes).
     if (!found && normalizedName && !isRetry) {
       if (process.env.DEBUG) {
-        console.log(`[debug] resolveRepo 404 for "${normalizedName}". Triggering deep init...`);
+        // Sanitize user-controlled values to prevent log injection (CodeQL js/log-injection).
+        logger.debug(
+          { repoName: String(normalizedName).replace(/[\r\n]/g, ' ') },
+          '[debug] resolveRepo 404, triggering deep init',
+        );
       }
       await backend.init();
       return await resolveRepo(normalizedName, true, req);
@@ -658,6 +830,13 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
     return found;
   };
+
+  // Lightweight healthcheck for Docker/orchestrator probes (#1147).
+  // Returns immediately so container managers do not confuse a long-lived
+  // SSE stream with an unhealthy server.
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
 
   // SSE heartbeat — clients connect to detect server liveness instantly.
   // When the server shuts down, the TCP connection drops and the client's
@@ -744,7 +923,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   });
 
   // Delete a repo — removes index, clone dir (if any), and unregisters it
-  app.delete('/api/repo', async (req, res) => {
+  // Rate-limited (CodeQL js/missing-rate-limiting): destructive operation
+  // doing fs.rm of clone + storage dirs. Default 60 rpm/IP is generous for
+  // delete; tighten if abuse is observed.
+  app.delete('/api/repo', createRouteLimiter(), async (req, res) => {
     try {
       const repoName = requestedRepo(req);
       if (!repoName) {
@@ -775,15 +957,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const storagePath = getStoragePath(entry.path);
         await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
 
-        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/
-        const cloneDir = getCloneDir(entry.name);
+        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
+        // getCloneDir now throws on names that are not filesystem-safe (e.g.
+        // local repos registered with names like "my project" or "org/repo").
+        // Such repos legitimately have no clone dir, so treat the rejection as
+        // "nothing to clean up" rather than letting it fail the delete handler.
+        let cloneDir: string | null = null;
         try {
-          const stat = await fs.stat(cloneDir);
-          if (stat.isDirectory()) {
-            await fs.rm(cloneDir, { recursive: true, force: true });
-          }
+          cloneDir = getCloneDir(entry.name);
         } catch {
-          /* clone dir may not exist (local repos) */
+          /* repo name not eligible for a clone dir (local repo) */
+        }
+        if (cloneDir) {
+          try {
+            const stat = await fs.stat(cloneDir);
+            if (stat.isDirectory()) {
+              await fs.rm(cloneDir, { recursive: true, force: true });
+            }
+          } catch {
+            /* clone dir may not exist */
+          }
         }
 
         // 3. Unregister from the global registry
@@ -835,8 +1028,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         res.once('close', abortStreaming);
 
         try {
-          await withLbugDb(lbugPath, async () =>
-            streamGraphNdjson(res, includeContent, abortController.signal),
+          // Read-only open: /api/graph never writes. Write-mode opens engage
+          // LadybugDB's checkpoint machinery (`.shadow` sidecar), which on
+          // Windows races with the OS file handle release and trips
+          // "Cannot open file ... lbug.shadow - Error 2". See pool-adapter.ts
+          // which already opens read-only for the same reason, and the
+          // /api/query precedent in PR #1655.
+          await withLbugDb(
+            lbugPath,
+            async () => streamGraphNdjson(res, includeContent, abortController.signal),
+            { readOnly: true },
           );
           if (!abortController.signal.aborted && !res.writableEnded) {
             res.end();
@@ -849,7 +1050,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         return;
       }
 
-      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent));
+      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent), {
+        readOnly: true,
+      });
       res.json(graph);
     } catch (err: any) {
       if (err instanceof ClientDisconnectedError) {
@@ -871,29 +1074,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Execute Cypher query
   app.post('/api/query', async (req, res) => {
-    try {
-      const cypher = req.body.cypher as string;
-      if (!cypher) {
-        res.status(400).json({ error: 'Missing "cypher" in request body' });
-        return;
-      }
-
-      if (isWriteQuery(cypher)) {
-        res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
-        return;
-      }
-
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
-      const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
-      res.json({ result });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Query failed' });
-    }
+    await handleQueryRequest(req, res, resolveRepo);
   });
 
   // Search (supports mode: 'hybrid' | 'semantic' | 'bm25', and optional enrichment)
@@ -918,64 +1099,70 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const mode: string = req.body.mode ?? 'hybrid';
       const enrich: boolean = req.body.enrich !== false; // default true
 
-      const results = await withLbugDb(lbugPath, async () => {
-        let searchResults: any[];
+      const results = await withLbugDb(
+        lbugPath,
+        async () => {
+          let searchResults: any[];
+          let ftsAvailable: boolean | undefined;
 
-        if (mode === 'semantic') {
-          const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
-          if (!isEmbedderReady()) {
-            return [] as any[];
-          }
-          const { semanticSearch: semSearch } =
-            await import('../core/embeddings/embedding-pipeline.js');
-          searchResults = await semSearch(executeQuery, query, limit);
-          // Normalize semantic results to HybridSearchResult shape
-          searchResults = searchResults.map((r: any, i: number) => ({
-            ...r,
-            score: r.score ?? 1 - (r.distance ?? 0),
-            rank: i + 1,
-            sources: ['semantic'],
-          }));
-        } else if (mode === 'bm25') {
-          searchResults = await searchFTSFromLbug(query, limit);
-          searchResults = searchResults.map((r: any, i: number) => ({
-            ...r,
-            rank: i + 1,
-            sources: ['bm25'],
-          }));
-        } else {
-          // hybrid (default)
-          const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
-          if (isEmbedderReady()) {
+          if (mode === 'semantic') {
+            const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
+            if (!isEmbedderReady()) {
+              return { searchResults: [] as any[], ftsAvailable: undefined };
+            }
             const { semanticSearch: semSearch } =
               await import('../core/embeddings/embedding-pipeline.js');
-            searchResults = await hybridSearch(query, limit, executeQuery, semSearch);
+            searchResults = await semSearch(executeQuery, query, limit);
+            // Normalize semantic results to HybridSearchResult shape
+            searchResults = searchResults.map((r: any, i: number) => ({
+              ...r,
+              score: r.score ?? 1 - (r.distance ?? 0),
+              rank: i + 1,
+              sources: ['semantic'],
+            }));
+          } else if (mode === 'bm25') {
+            const ftsResponse = await searchFTSFromLbug(query, limit);
+            ftsAvailable = ftsResponse.ftsAvailable;
+            searchResults = ftsResponse.results.map((r: any, i: number) => ({
+              ...r,
+              rank: i + 1,
+              sources: ['bm25'],
+            }));
           } else {
-            searchResults = await searchFTSFromLbug(query, limit);
+            // hybrid (default)
+            const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
+            if (isEmbedderReady()) {
+              const { semanticSearch: semSearch } =
+                await import('../core/embeddings/embedding-pipeline.js');
+              searchResults = await hybridSearch(query, limit, executeQuery, semSearch);
+            } else {
+              const ftsResponse = await searchFTSFromLbug(query, limit);
+              ftsAvailable = ftsResponse.ftsAvailable;
+              searchResults = ftsResponse.results;
+            }
           }
-        }
 
-        if (!enrich) return searchResults;
+          if (!enrich) return { searchResults, ftsAvailable };
 
-        // Server-side enrichment: add connections, cluster, processes per result
-        // Uses parameterized queries to prevent Cypher injection via nodeId
-        const validLabel = (label: string): boolean =>
-          (NODE_TABLES as readonly string[]).includes(label);
+          // Server-side enrichment: add connections, cluster, processes per result
+          // Uses parameterized queries to prevent Cypher injection via nodeId
+          const validLabel = (label: string): boolean =>
+            (NODE_TABLES as readonly string[]).includes(label);
 
-        const enriched = await Promise.all(
-          searchResults.slice(0, limit).map(async (r: any) => {
-            const nodeId: string = r.nodeId || r.id || '';
-            const nodeLabel = nodeId.split(':')[0];
-            const enrichment: { connections?: any; cluster?: string; processes?: any[] } = {};
+          const enriched = await Promise.all(
+            searchResults.slice(0, limit).map(async (r: any) => {
+              const nodeId: string = r.nodeId || r.id || '';
+              const nodeLabel = nodeId.split(':')[0];
+              const enrichment: { connections?: any; cluster?: string; processes?: any[] } = {};
 
-            if (!nodeId || !validLabel(nodeLabel)) return { ...r, ...enrichment };
+              if (!nodeId || !validLabel(nodeLabel)) return { ...r, ...enrichment };
 
-            // Run connections, cluster, and process queries in parallel
-            // Label is validated against NODE_TABLES (compile-time safe identifiers);
-            // nodeId uses $nid parameter binding to prevent injection
-            const [connRes, clusterRes, procRes] = await Promise.all([
-              executePrepared(
-                `
+              // Run connections, cluster, and process queries in parallel
+              // Label is validated against NODE_TABLES (compile-time safe identifiers);
+              // nodeId uses $nid parameter binding to prevent injection
+              const [connRes, clusterRes, procRes] = await Promise.all([
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               OPTIONAL MATCH (n)-[r1:CodeRelation]->(dst)
               OPTIONAL MATCH (src)-[r2:CodeRelation]->(n)
@@ -984,146 +1171,127 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 collect(DISTINCT {name: src.name, type: r2.type, confidence: r2.confidence}) AS incoming
               LIMIT 1
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-              executePrepared(
-                `
+                  { nid: nodeId },
+                ).catch(() => []),
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
               RETURN c.label AS label, c.description AS description
               LIMIT 1
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-              executePrepared(
-                `
+                  { nid: nodeId },
+                ).catch(() => []),
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               MATCH (n)-[rel:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
               RETURN p.id AS id, p.label AS label, rel.step AS step, p.stepCount AS stepCount
               ORDER BY rel.step
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-            ]);
+                  { nid: nodeId },
+                ).catch(() => []),
+              ]);
 
-            if (connRes.length > 0) {
-              const row = connRes[0];
-              const outgoing = (Array.isArray(row) ? row[0] : row.outgoing || [])
-                .filter((c: any) => c?.name)
-                .slice(0, 5);
-              const incoming = (Array.isArray(row) ? row[1] : row.incoming || [])
-                .filter((c: any) => c?.name)
-                .slice(0, 5);
-              enrichment.connections = { outgoing, incoming };
-            }
+              if (connRes.length > 0) {
+                const row = connRes[0];
+                const outgoing = (Array.isArray(row) ? row[0] : row.outgoing || [])
+                  .filter((c: any) => c?.name)
+                  .slice(0, 5);
+                const incoming = (Array.isArray(row) ? row[1] : row.incoming || [])
+                  .filter((c: any) => c?.name)
+                  .slice(0, 5);
+                enrichment.connections = { outgoing, incoming };
+              }
 
-            if (clusterRes.length > 0) {
-              const row = clusterRes[0];
-              enrichment.cluster = Array.isArray(row) ? row[0] : row.label;
-            }
+              if (clusterRes.length > 0) {
+                const row = clusterRes[0];
+                enrichment.cluster = Array.isArray(row) ? row[0] : row.label;
+              }
 
-            if (procRes.length > 0) {
-              enrichment.processes = procRes
-                .map((row: any) => ({
-                  id: Array.isArray(row) ? row[0] : row.id,
-                  label: Array.isArray(row) ? row[1] : row.label,
-                  step: Array.isArray(row) ? row[2] : row.step,
-                  stepCount: Array.isArray(row) ? row[3] : row.stepCount,
-                }))
-                .filter((p: any) => p.id && p.label);
-            }
+              if (procRes.length > 0) {
+                enrichment.processes = procRes
+                  .map((row: any) => ({
+                    id: Array.isArray(row) ? row[0] : row.id,
+                    label: Array.isArray(row) ? row[1] : row.label,
+                    step: Array.isArray(row) ? row[2] : row.step,
+                    stepCount: Array.isArray(row) ? row[3] : row.stepCount,
+                  }))
+                  .filter((p: any) => p.id && p.label);
+              }
 
-            return { ...r, ...enrichment };
-          }),
-        );
+              return { ...r, ...enrichment };
+            }),
+          );
 
-        return enriched;
-      });
-      res.json({ results });
+          return { searchResults: enriched, ftsAvailable };
+        },
+        { readOnly: true },
+      );
+      const response: any = { results: results.searchResults ?? results };
+      if (results.ftsAvailable === false) {
+        response.warning =
+          'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.';
+      }
+      res.json(response);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Search failed' });
     }
   });
 
   // Read file — with path traversal guard
-  app.get('/api/file', async (req, res) => {
-    try {
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-      const filePath = req.query.path as string;
-      if (!filePath) {
-        res.status(400).json({ error: 'Missing path' });
-        return;
-      }
-
-      // Prevent path traversal — resolve and verify the path stays within the repo root
-      const repoRoot = path.resolve(entry.path);
-      const fullPath = path.resolve(repoRoot, filePath);
-      if (!fullPath.startsWith(repoRoot + path.sep) && fullPath !== repoRoot) {
-        res.status(403).json({ error: 'Path traversal denied' });
-        return;
-      }
-
-      const raw = await fs.readFile(fullPath, 'utf-8');
-
-      // Optional line-range support: ?startLine=10&endLine=50
-      // Returns only the requested slice (0-indexed), plus metadata.
-      const startLine = req.query.startLine !== undefined ? Number(req.query.startLine) : undefined;
-      const endLine = req.query.endLine !== undefined ? Number(req.query.endLine) : undefined;
-
-      if (startLine !== undefined && Number.isFinite(startLine)) {
-        const lines = raw.split('\n');
-        const start = Math.max(0, startLine);
-        const end =
-          endLine !== undefined && Number.isFinite(endLine)
-            ? Math.min(lines.length, endLine + 1)
-            : lines.length;
-        res.json({
-          content: lines.slice(start, end).join('\n'),
-          startLine: start,
-          endLine: end - 1,
-          totalLines: lines.length,
-        });
-      } else {
-        res.json({ content: raw, totalLines: raw.split('\n').length });
-      }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        res.status(404).json({ error: 'File not found' });
-      } else {
-        res.status(500).json({ error: err.message || 'Failed to read file' });
-      }
+  // Rate-limited (CodeQL js/missing-rate-limiting): per-request fs.readFile.
+  app.get('/api/file', createRouteLimiter(), async (req, res) => {
+    const entry = await resolveRepo(requestedRepo(req));
+    if (!entry) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
     }
+    await handleFileRequest(req, res, entry.path);
   });
 
   // Grep — regex search across file contents in the indexed repo
   // Uses filesystem-based search for memory efficiency (never loads all files into memory)
-  app.get('/api/grep', async (req, res) => {
+  // Rate-limited (CodeQL js/missing-rate-limiting): scans every file in
+  // the indexed repo per request — heaviest I/O endpoint. Same default 60
+  // rpm/IP for now; consider tightening if real-world load shows abuse.
+  app.get('/api/grep', createRouteLimiter(), async (req, res) => {
     try {
       const entry = await resolveRepo(requestedRepo(req));
       if (!entry) {
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const pattern = req.query.pattern as string;
-      if (!pattern) {
+      // Type-confusion guard (CodeQL js/type-confusion-through-parameter-tampering):
+      // req.query.pattern is `string | string[] | ParsedQs` — without an explicit
+      // type check, the `.length` guard below counts array elements instead of
+      // characters, allowing arbitrarily long patterns through.
+      const rawPattern = req.query.pattern;
+      if (rawPattern === undefined) {
+        res.status(400).json({ error: 'Missing "pattern" query parameter' });
+        return;
+      }
+      const pattern = assertString(rawPattern, 'pattern');
+      if (pattern.length === 0) {
         res.status(400).json({ error: 'Missing "pattern" query parameter' });
         return;
       }
 
-      // ReDoS protection: reject overly long or dangerous patterns
+      // Length cap: applies to both literal and regex modes as a defense-in-depth
+      // bound against pathological input.
       if (pattern.length > 200) {
         res.status(400).json({ error: 'Pattern too long (max 200 characters)' });
         return;
       }
 
-      // Validate regex syntax
+      // Treat user input as a literal substring in all cases to prevent
+      // regex-injection/ReDoS via attacker-controlled regex syntax.
+      const effectivePattern = escapeRegExp(pattern);
+
+      // Validate regex syntax (catches both opt-in user regex and any escapeRegExp bug)
       let regex: RegExp;
       try {
-        regex = new RegExp(pattern, 'gim');
+        regex = new RegExp(effectivePattern, 'gim');
       } catch {
         res.status(400).json({ error: 'Invalid regex pattern' });
         return;
@@ -1139,8 +1307,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       // Get file paths from the graph (lightweight — no content loaded)
       const lbugPath = path.join(entry.storagePath, 'lbug');
-      const fileRows = await withLbugDb(lbugPath, () =>
-        executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
+      const fileRows = await withLbugDb(
+        lbugPath,
+        () =>
+          executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
+        { readOnly: true },
       );
 
       // Search files on disk one at a time (constant memory)
@@ -1171,7 +1342,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       res.json({ results });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Grep failed' });
+      res.status(statusFromError(err)).json({ error: err.message || 'Grep failed' });
     }
   });
 
@@ -1242,7 +1413,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // ── Analyze API ──────────────────────────────────────────────────────
 
   // POST /api/analyze — start a new analysis job
-  app.post('/api/analyze', async (req, res) => {
+  app.post('/api/analyze', createRouteLimiter({ limit: 10 }), async (req, res) => {
     try {
       const { url: repoUrl, path: repoLocalPath, force, embeddings, dropEmbeddings } = req.body;
 
@@ -1375,7 +1546,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     });
                   })
                   .catch((err) => {
-                    console.error('backend.init() failed after analyze:', err);
+                    logger.error({ err }, 'backend.init() failed after analyze:');
                     jobManager.updateJob(job.id, {
                       status: 'failed',
                       error: 'Server failed to reload after analysis. Try again.',
@@ -1407,7 +1578,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 j.retryCount++;
                 const delay = 1000 * Math.pow(2, j.retryCount - 1); // 1s, 2s
                 const lastErr = stderrChunks.trim().split('\n').pop() || '';
-                console.warn(
+                logger.warn(
                   `Analyze worker crashed (code ${code}), retry ${j.retryCount}/${MAX_WORKER_RETRIES} in ${delay}ms` +
                     (lastErr ? `: ${lastErr}` : ''),
                 );
@@ -1509,7 +1680,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const embedJobManager = new JobManager();
 
   // POST /api/embed — trigger server-side embedding generation
-  app.post('/api/embed', async (req, res) => {
+  app.post('/api/embed', createRouteLimiter({ limit: 20 }), async (req, res) => {
     try {
       const entry = await resolveRepo(requestedRepo(req));
       if (!entry) {
@@ -1588,6 +1759,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
               undefined, // context
               existingEmbeddings,
             );
+
+            // Flush WAL so subsequent /api/search requests see the new
+            // embeddings immediately (#1149). In the CLI path closeLbug()
+            // handles this during process exit, but the server keeps the
+            // connection open for other routes — a CHECKPOINT is enough.
+            await flushWAL();
           });
 
           clearTimeout(embedTimeout);
@@ -1669,7 +1846,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
   // Global error handler — catch anything the route handlers miss
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error('Unhandled error:', err);
+    logger.error({ err }, 'Unhandled error:');
     res.status(500).json({ error: 'Internal server error' });
   });
 
@@ -1683,7 +1860,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     });
     server.on('error', (err) => reject(err));
 
-    // Graceful shutdown — close Express + LadybugDB cleanly
+    // Graceful shutdown — close Express + LadybugDB cleanly. Pino's default
+    // destination is `sync: false` (buffered); `flushLoggerSync()` before
+    // `process.exit` so records emitted during cleanup reach stderr.
     const shutdown = async () => {
       console.log('\nShutting down...');
       server.close();
@@ -1692,22 +1871,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       await cleanupMcp();
       await closeLbug();
       await backend.disconnect();
+      const { flushLoggerSync } = await import('../core/logger.js');
+      flushLoggerSync();
       process.exit(0);
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
 
-    // Catch-all crash guards (mirrors startMCPServer in mcp/server.ts)
+    // Catch-all crash guards (mirrors startMCPServer in mcp/server.ts).
+    // Pino v10's default destination is buffered (`sync: false`) — call
+    // `flushLoggerSync()` after logging and before triggering shutdown
+    // so the crash record reaches stderr regardless of how cleanup goes.
+    // Worker-thread transports (pino-pretty under TTY) handle their own
+    // flush on process exit in v10. `pino.final` was removed in v10
+    // because the new transport architecture made it unnecessary.
     let shuttingDown = false;
     process.on('uncaughtException', (err) => {
-      console.error('GitNexus uncaughtException:', err?.stack || err);
+      logger.error({ err }, 'GitNexus uncaughtException');
+      flushLoggerSync();
       if (!shuttingDown) {
         shuttingDown = true;
         shutdown().catch(() => {});
       }
     });
-    process.on('unhandledRejection', (reason: any) => {
-      console.error('GitNexus unhandledRejection:', reason?.stack || reason);
+    process.on('unhandledRejection', (reason: unknown) => {
+      // Availability-first: log the rejection without exiting.
+      const err = reason instanceof Error ? reason : new Error(String(reason));
+      logger.error({ err }, 'GitNexus unhandledRejection');
     });
   });
 };

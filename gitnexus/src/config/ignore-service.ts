@@ -2,6 +2,7 @@ import ignore, { type Ignore } from 'ignore';
 import fs from 'fs/promises';
 import nodePath from 'path';
 import type { Path } from 'path-scurry';
+import { logger } from '../core/logger.js';
 
 const DEFAULT_IGNORE_LIST = new Set([
   // Version Control
@@ -24,6 +25,8 @@ const DEFAULT_IGNORE_LIST = new Set([
   'bower_components',
   'jspm_packages',
   'vendor', // PHP/Go
+  'third_party', // C/C++ (Google-style vendored dependencies)
+  '3rdparty', // C/C++ (alternate spelling, also Qt convention)
   // 'packages' removed - commonly used for monorepo source code (lerna, pnpm, yarn workspaces)
   'venv',
   '.venv',
@@ -280,9 +283,19 @@ const IGNORED_FILES = new Set([
 // deterministic results independent of per-repo config.
 export const shouldIgnorePath = (filePath: string): boolean => {
   const normalizedPath = filePath.replace(/\\/g, '/');
+  const normalizedPathLower = normalizedPath.toLowerCase();
   const parts = normalizedPath.split('/');
   const fileName = parts[parts.length - 1];
   const fileNameLower = fileName.toLowerCase();
+
+  // Laravel compiles Blade templates into generated PHP cache files under
+  // storage/framework/views.  Source templates live in resources/views and are
+  // handled separately; compiled cache should not become source-of-truth. Keep
+  // storage/framework/cache parseable unless a separate warning source is proven:
+  // Laravel route/config cache files are ordinary generated PHP, not Blade.
+  if (/(^|\/)storage\/framework\/views(\/|$)/.test(normalizedPathLower)) {
+    return true;
+  }
 
   // Check if any path segment is in the hardcoded ignore list.
   for (const part of parts) {
@@ -365,7 +378,7 @@ export const loadIgnoreRules = async (
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException).code;
       if (code !== 'ENOENT') {
-        console.warn(`  Warning: could not read ${filename}: ${(err as Error).message}`);
+        logger.warn(`  Warning: could not read ${filename}: ${(err as Error).message}`);
       }
     }
   }

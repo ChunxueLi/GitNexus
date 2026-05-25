@@ -18,6 +18,7 @@ import { kotlinImportConfig } from '../import-resolvers/configs/jvm.js';
 import { extractKotlinNamedBindings } from '../named-bindings/kotlin.js';
 import { appendKotlinWildcard } from '../import-resolvers/jvm.js';
 import { KOTLIN_QUERIES } from '../tree-sitter-queries.js';
+import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { kotlinCallConfig } from '../call-extractors/configs/jvm.js';
@@ -28,6 +29,16 @@ import { kotlinMethodConfig } from '../method-extractors/configs/jvm.js';
 import { createVariableExtractor } from '../variable-extractors/generic.js';
 import { kotlinVariableConfig } from '../variable-extractors/configs/jvm.js';
 import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import {
+  emitKotlinScopeCaptures,
+  interpretKotlinImport,
+  interpretKotlinTypeBinding,
+  kotlinArityCompatibility,
+  kotlinBindingScopeFor,
+  kotlinImportOwningScope,
+  kotlinMergeBindings,
+  kotlinReceiverBinding,
+} from './kotlin/index.js';
 
 /** Check if a Kotlin function_declaration capture is inside a class_body (i.e., a method).
  *  Kotlin grammar uses function_declaration for both top-level functions and class methods.
@@ -105,6 +116,47 @@ const BUILT_INS: ReadonlySet<string> = new Set([
 export const kotlinProvider = defineLanguage({
   id: SupportedLanguages.Kotlin,
   extensions: ['.kt', '.kts'],
+  entryPointPatterns: [
+    /^on(Create|Start|Resume|Pause|Stop|Destroy)$/,
+    /^do[A-Z]/,
+    /^create[A-Z]/,
+    /^build[A-Z]/,
+    /ViewModel$/,
+    /^module$/,
+    /Service$/,
+  ],
+  astFrameworkPatterns: [
+    {
+      framework: 'spring-kotlin',
+      entryPointMultiplier: 3.2,
+      reason: 'spring-kotlin-annotation',
+      patterns: [
+        '@RestController',
+        '@Controller',
+        '@GetMapping',
+        '@PostMapping',
+        '@RequestMapping',
+      ],
+    },
+    {
+      framework: 'jaxrs',
+      entryPointMultiplier: 3.0,
+      reason: 'jaxrs-annotation',
+      patterns: ['@Path', '@GET', '@POST', '@PUT', '@DELETE'],
+    },
+    {
+      framework: 'ktor',
+      entryPointMultiplier: 2.8,
+      reason: 'ktor-routing',
+      patterns: ['routing', 'embeddedServer', 'Application.module'],
+    },
+    {
+      framework: 'android-kotlin',
+      entryPointMultiplier: 2.5,
+      reason: 'android-annotation',
+      patterns: ['@AndroidEntryPoint', 'AppCompatActivity', 'Fragment('],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: KOTLIN_QUERIES,
   typeConfig: kotlinTypeConfig,
   exportChecker: kotlinExportChecker,
@@ -124,4 +176,14 @@ export const kotlinProvider = defineLanguage({
     if (isKotlinClassMethod(functionNode)) return 'Method';
     return defaultLabel;
   },
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks ──
+  emitScopeCaptures: emitKotlinScopeCaptures,
+  interpretImport: interpretKotlinImport,
+  interpretTypeBinding: interpretKotlinTypeBinding,
+  bindingScopeFor: kotlinBindingScopeFor,
+  importOwningScope: kotlinImportOwningScope,
+  mergeBindings: (_scope, bindings) => kotlinMergeBindings(bindings),
+  receiverBinding: kotlinReceiverBinding,
+  arityCompatibility: kotlinArityCompatibility,
 });

@@ -10,6 +10,7 @@
 import { SupportedLanguages } from 'gitnexus-shared';
 import type { NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
+import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import {
   typescriptClassConfig,
@@ -55,6 +56,16 @@ import {
   typescriptArityCompatibility,
   resolveTsImportTarget,
 } from './typescript/index.js';
+import {
+  emitJsScopeCaptures,
+  interpretJsImport,
+  interpretJsTypeBinding,
+  jsBindingScopeFor,
+  jsImportOwningScope,
+  jsReceiverBinding,
+  jsMergeBindings,
+  jsArityCompatibility,
+} from './javascript/index.js';
 
 /**
  * TypeScript/JavaScript: arrow_function and function_expression are
@@ -66,11 +77,21 @@ import {
  *   - `{ addItem: (item) => ... }` (pair / property_assignment) → "addItem"
  *     Covers Zustand stores, TanStack Query factories, React Context
  *     providers, and most other HOF-heavy idioms (issue #1166).
+ *   - `const X = HOC((args) => { ... })` (arguments → call_expression →
+ *     variable_declarator) → "X". Covers `React.forwardRef`, `memo`,
+ *     `useCallback`, `useMemo`, `observer`, `debounce`, and other HOC
+ *     factories that wrap their behaviour-defining arrow. Without this
+ *     branch, every shadcn/Radix UI component (`const Button =
+ *     React.forwardRef(...)`) registered as an anonymous arrow with
+ *     calls inside falling back to File-level attribution. The same
+ *     applied to all `useCallback` / `useMemo` callbacks bound to a
+ *     const — the sole way to give them a named caller anchor.
  *
  * Returns `null` for funcName when the arrow lives in a context that has
- * no static name — call arguments, computed keys, return-from-arrow
- * positions. The parent walk in findEnclosingFunctionId then continues
- * up to the next named ancestor (or to the file).
+ * no static name — bare call arguments (not bound to a const), computed
+ * keys, return-from-arrow positions. The parent walk in
+ * findEnclosingFunctionId then continues up to the next named ancestor
+ * (or to the file).
  */
 const tsExtractFunctionName = (
   node: SyntaxNode,
@@ -111,6 +132,37 @@ const tsExtractFunctionName = (
     }
     // computed_property_name (`[ACTION_KEY]`) and other dynamic keys have
     // no static name — fall through anonymous.
+    return { funcName: null, label: 'Function' };
+  }
+
+  // HOC-wrapped variable declarations: `const Button = forwardRef((p, r) => { ... })`,
+  // `const handleClick = useCallback(() => doStuff(), [deps])`,
+  // `const Card = React.memo((props) => { ... })`. The arrow's `parent` is
+  // `arguments`, grandparent is `call_expression`, great-grandparent is
+  // `variable_declarator`. Walk the chain up and take the variable's name
+  // — the meaningful identifier the developer wrote on the LHS. Mirrors
+  // the four registry-primary patterns in `typescript/query.ts`. The
+  // wrapping callee (`forwardRef`, `memo`, `React.memo`, `useCallback`,
+  // user-defined HOCs) is intentionally NOT constrained: any function
+  // call whose result is bound to a const and whose first/positional
+  // argument is an arrow takes the const's name. Chained array-method
+  // calls (`const x = arr.find((y) => p(y))`) match too and produce a
+  // mostly-harmless `Function:x` (consumed as a value, never invoked),
+  // accepted as a small false-positive cost vs. the much larger gain of
+  // capturing the React UI-component idiom.
+  if (parent.type === 'arguments') {
+    const callExpr = parent.parent;
+    if (!callExpr || callExpr.type !== 'call_expression') {
+      return { funcName: null, label: 'Function' };
+    }
+    const declarator = callExpr.parent;
+    if (!declarator || declarator.type !== 'variable_declarator') {
+      return { funcName: null, label: 'Function' };
+    }
+    const nameNode = declarator.childForFieldName?.('name');
+    if (nameNode?.type === 'identifier') {
+      return { funcName: nameNode.text, label: 'Function' };
+    }
     return { funcName: null, label: 'Function' };
   }
 
@@ -217,6 +269,29 @@ export const BUILT_INS: ReadonlySet<string> = new Set([
 export const typescriptProvider = defineLanguage({
   id: SupportedLanguages.TypeScript,
   extensions: ['.ts', '.tsx'],
+  entryPointPatterns: [/^use[A-Z]/],
+  astFrameworkPatterns: [
+    {
+      framework: 'nestjs',
+      entryPointMultiplier: 3.2,
+      reason: 'nestjs-decorator',
+      patterns: ['@Controller', '@Get', '@Post', '@Put', '@Delete', '@Patch'],
+    },
+    {
+      framework: 'expo-router',
+      entryPointMultiplier: 2.5,
+      reason: 'expo-router-navigation',
+      patterns: [
+        'router.push',
+        'router.replace',
+        'router.navigate',
+        'useRouter',
+        'useLocalSearchParams',
+        'useSegments',
+        'expo-router',
+      ],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: TYPESCRIPT_QUERIES,
   typeConfig: typescriptConfig,
   exportChecker: tsExportChecker,
@@ -256,6 +331,29 @@ export const typescriptProvider = defineLanguage({
 export const javascriptProvider = defineLanguage({
   id: SupportedLanguages.JavaScript,
   extensions: ['.js', '.jsx'],
+  entryPointPatterns: [/^use[A-Z]/],
+  astFrameworkPatterns: [
+    {
+      framework: 'nestjs',
+      entryPointMultiplier: 3.2,
+      reason: 'nestjs-decorator',
+      patterns: ['@Controller', '@Get', '@Post', '@Put', '@Delete', '@Patch'],
+    },
+    {
+      framework: 'expo-router',
+      entryPointMultiplier: 2.5,
+      reason: 'expo-router-navigation',
+      patterns: [
+        'router.push',
+        'router.replace',
+        'router.navigate',
+        'useRouter',
+        'useLocalSearchParams',
+        'useSegments',
+        'expo-router',
+      ],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: JAVASCRIPT_QUERIES,
   typeConfig: typescriptConfig,
   exportChecker: tsExportChecker,
@@ -271,4 +369,19 @@ export const javascriptProvider = defineLanguage({
   classExtractor: createClassExtractor(javascriptClassConfig),
   heritageExtractor: createHeritageExtractor(SupportedLanguages.JavaScript),
   builtInNames: BUILT_INS,
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
+  // JavaScript is the fourth migration after Python, C#, and TypeScript.
+  // Hooks are thin wrappers over the TypeScript implementations where
+  // semantics are identical; JS-specific additions (CJS require(),
+  // JSDoc type bindings) live in ./javascript/captures.ts.
+  // See ./javascript/index.ts for the full per-module rationale.
+  emitScopeCaptures: emitJsScopeCaptures,
+  interpretImport: interpretJsImport,
+  interpretTypeBinding: interpretJsTypeBinding,
+  bindingScopeFor: jsBindingScopeFor,
+  importOwningScope: jsImportOwningScope,
+  mergeBindings: (_scope, bindings) => jsMergeBindings(bindings),
+  receiverBinding: jsReceiverBinding,
+  arityCompatibility: jsArityCompatibility,
 });

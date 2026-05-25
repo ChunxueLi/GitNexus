@@ -84,6 +84,63 @@ export const TYPESCRIPT_QUERIES = `
   key: (string (string_fragment) @name)
   value: (function_expression)) @definition.function
 
+; HOC-wrapped variable declarations: \`const X = HOC((args) => { ... })\`.
+; Mirrors the registry-primary patterns in \`languages/typescript/query.ts\`
+; so the legacy Call-Resolution DAG and the registry-primary pipeline
+; produce the same set of \`Function\` nodes — required for the CI parity
+; gate. Covers React.forwardRef / memo / useCallback / useMemo / observer
+; / debounce / user-defined HOC factories. The \`var X = HOC(...)\` form is
+; mirrored too (registry-primary has it) so that codebases mixing \`var\` and
+; \`const\` see identical attribution on both pipelines. See
+; \`tsExtractFunctionName\` for the resolution logic and the \`query.ts\`
+; comment for the full anchor-discipline rationale and the chained-
+; array-method trade-off.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        arguments: (arguments
+          (arrow_function)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        arguments: (arguments
+          (function_expression)))))) @definition.function
+
+; \`var X = HOC(...)\` parity with registry-primary. Legacy code (and any
+; transpiler output that downlevels \`const\` to \`var\`) hits this shape.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
 (lexical_declaration
@@ -259,6 +316,57 @@ export const JAVASCRIPT_QUERIES = `
 (pair
   key: (string (string_fragment) @name)
   value: (function_expression)) @definition.function
+
+; HOC-wrapped variable declarations: \`const X = HOC((args) => { ... })\`.
+; See TYPESCRIPT_QUERIES section above for the full rationale (issue #1166
+; follow-up — covers forwardRef / memo / useCallback / useMemo / observer
+; / debounce / user-defined HOC factories). Both \`const\` and \`var\` forms
+; are mirrored so JS code that uses \`var\` (or transpiler output) gets the
+; same attribution as the registry-primary path.
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(lexical_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (function_expression))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        arguments: (arguments
+          (arrow_function)))))) @definition.function
+
+(export_statement
+  declaration: (lexical_declaration
+    (variable_declarator
+      name: (identifier) @name
+      value: (call_expression
+        arguments: (arguments
+          (function_expression)))))) @definition.function
+
+; \`var X = HOC(...)\` parity with registry-primary.
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (arrow_function))))) @definition.function
+
+(variable_declaration
+  (variable_declarator
+    name: (identifier) @name
+    value: (call_expression
+      arguments: (arguments
+        (function_expression))))) @definition.function
 
 ; Variable/constant declarations (non-function values).
 ; Overlap with @definition.function patterns is handled by parse-worker dedup.
@@ -572,7 +680,15 @@ export const GO_QUERIES = `
 export const CPP_QUERIES = `
 ; Classes, Structs, Namespaces
 (class_specifier name: (type_identifier) @name) @definition.class
+(class_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.class
 (struct_specifier name: (type_identifier) @name) @definition.struct
+(struct_specifier
+  name: (template_type
+    (type_identifier) @name
+    (template_argument_list) @template-arguments)) @definition.struct
 (namespace_definition name: (namespace_identifier) @name) @definition.namespace
 (enum_specifier name: (type_identifier) @name) @definition.enum
 
@@ -586,7 +702,9 @@ export const CPP_QUERIES = `
 
 ; Functions & Methods (direct declarator)
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(function_definition declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (identifier) @name))) @definition.method
+(function_definition declarator: (function_declarator declarator: (qualified_identifier name: (operator_name) @name))) @definition.method
 
 ; Functions/methods returning pointers (pointer_declarator wraps function_declarator)
 (function_definition declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
@@ -598,14 +716,18 @@ export const CPP_QUERIES = `
 
 ; Functions/methods returning references (reference_declarator wraps function_declarator)
 (function_definition declarator: (reference_declarator (function_declarator declarator: (identifier) @name))) @definition.function
+(function_definition declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 (function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (identifier) @name)))) @definition.method
+(function_definition declarator: (reference_declarator (function_declarator declarator: (qualified_identifier name: (operator_name) @name)))) @definition.method
 
 ; Destructors (destructor_name is distinct from identifier in tree-sitter-cpp)
 (function_definition declarator: (function_declarator declarator: (qualified_identifier name: (destructor_name) @name))) @definition.method
 
 ; Function declarations / prototypes (common in headers)
 (declaration declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(declaration declarator: (function_declarator declarator: (operator_name) @name)) @definition.function
 (declaration declarator: (pointer_declarator declarator: (function_declarator declarator: (identifier) @name))) @definition.function
+(declaration declarator: (reference_declarator (function_declarator declarator: (operator_name) @name))) @definition.function
 
 ; Class/struct data member fields (Address address; int count;)
 ; Uses field_identifier to exclude method declarations (which use function_declarator)
@@ -624,13 +746,13 @@ export const CPP_QUERIES = `
 
 ; Inline class method declarations (inside class body, no body: void save();)
 ; tree-sitter-cpp uses field_identifier (not identifier) for names inside class bodies
-(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name)) @definition.method
+(field_declaration declarator: (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name)) @definition.method
 
 ; Inline class method declarations returning a pointer (User* lookup();)
 (field_declaration declarator: (pointer_declarator declarator: (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
 
 ; Inline class method declarations returning a reference (User& lookup();)
-(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier)] @name))) @definition.method
+(field_declaration declarator: (reference_declarator (function_declarator declarator: [(field_identifier) (identifier) (operator_name)] @name))) @definition.method
 
 ; Inline class method definitions (inside class body, with body: void Foo() { ... })
 (field_declaration_list
@@ -654,6 +776,11 @@ export const CPP_QUERIES = `
 
 ; Templates
 (template_declaration (class_specifier name: (type_identifier) @name)) @definition.template
+(template_declaration
+  (class_specifier
+    name: (template_type
+      (type_identifier) @name
+      (template_argument_list) @template-arguments))) @definition.template
 (template_declaration (function_definition declarator: (function_declarator declarator: (identifier) @name))) @definition.template
 
 ; Includes
@@ -664,6 +791,8 @@ export const CPP_QUERIES = `
 (call_expression function: (field_expression field: (field_identifier) @call.name)) @call
 (call_expression function: (qualified_identifier name: (identifier) @call.name)) @call
 (call_expression function: (template_function name: (identifier) @call.name)) @call
+(binary_expression operator: "+" @call.name) @call
+(binary_expression operator: "<<" @call.name) @call
 
 ; Constructor calls: new User()
 (new_expression type: (type_identifier) @call.name) @call
@@ -907,6 +1036,16 @@ export const PHP_QUERIES = `
 
 ; ── Heritage: use trait (must capture enclosing class name) ──────────────────
 (class_declaration
+  name: (name) @heritage.class
+  body: (declaration_list
+    (use_declaration
+      [(name) (qualified_name)] @heritage.trait))) @heritage
+
+; ── Heritage: trait uses another trait (transitive trait composition) ────────
+; PHP allows a trait body to contain "use OtherTrait;". The trait-uses-trait
+; IMPLEMENTS edge is required by buildPhpMro to compute the full transitive
+; trait closure (depth 3+ chains).
+(trait_declaration
   name: (name) @heritage.class
   body: (declaration_list
     (use_declaration

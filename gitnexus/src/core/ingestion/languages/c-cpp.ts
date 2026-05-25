@@ -12,6 +12,7 @@ import { SupportedLanguages } from 'gitnexus-shared';
 import { createClassExtractor } from '../class-extractors/generic.js';
 import { cClassConfig, cppClassConfig } from '../class-extractors/configs/c-cpp.js';
 import { defineLanguage } from '../language-provider.js';
+import type { AstFrameworkPatternConfig } from '../language-provider.js';
 import { typeConfig as cCppConfig } from '../type-extractors/c-cpp.js';
 import { cCppExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
@@ -44,6 +45,26 @@ import { cVariableConfig, cppVariableConfig } from '../variable-extractors/confi
 import { createCallExtractor } from '../call-extractors/generic.js';
 import { cCallConfig, cppCallConfig } from '../call-extractors/configs/c-cpp.js';
 import { createHeritageExtractor } from '../heritage-extractors/generic.js';
+import { stripUeMacros } from '../cpp-ue-preprocessor.js';
+import {
+  emitCScopeCaptures,
+  interpretCImport,
+  interpretCTypeBinding,
+  cArityCompatibility,
+  cBindingScopeFor,
+  cImportOwningScope,
+  cReceiverBinding,
+} from './c/index.js';
+import {
+  emitCppScopeCaptures,
+  interpretCppImport,
+  interpretCppTypeBinding,
+  cppArityCompatibility,
+  cppBindingScopeFor,
+  cppImportOwningScope,
+  cppReceiverBinding,
+} from './cpp/index.js';
+import { extractCppTemplateConstraints } from './cpp/constraint-extractor.js';
 
 const C_BUILT_INS: ReadonlySet<string> = new Set([
   'printf',
@@ -210,6 +231,7 @@ const cCppExtractFunctionName = (
           c?.type === 'qualified_identifier' ||
           c?.type === 'identifier' ||
           c?.type === 'field_identifier' ||
+          c?.type === 'operator_name' ||
           c?.type === 'parenthesized_declarator'
         ) {
           innerDeclarator = c;
@@ -223,7 +245,7 @@ const cCppExtractFunctionName = (
       if (!nameNode) {
         for (let i = 0; i < innerDeclarator.childCount; i++) {
           const c = innerDeclarator.child(i);
-          if (c?.type === 'identifier') {
+          if (c?.type === 'identifier' || c?.type === 'operator_name') {
             nameNode = c;
             break;
           }
@@ -235,7 +257,8 @@ const cCppExtractFunctionName = (
       }
     } else if (
       innerDeclarator?.type === 'identifier' ||
-      innerDeclarator?.type === 'field_identifier'
+      innerDeclarator?.type === 'field_identifier' ||
+      innerDeclarator?.type === 'operator_name'
     ) {
       // field_identifier is used for method names inside C++ class bodies
       funcName = innerDeclarator.text;
@@ -254,7 +277,7 @@ const cCppExtractFunctionName = (
         if (!nameNode) {
           for (let i = 0; i < nestedId.childCount; i++) {
             const c = nestedId.child(i);
-            if (c?.type === 'identifier') {
+            if (c?.type === 'identifier' || c?.type === 'operator_name') {
               nameNode = c;
               break;
             }
@@ -292,12 +315,19 @@ const cCppExtractFunctionName = (
   return { funcName, label };
 };
 
-/** Check if a C/C++ function_definition is inside a class or struct body.
+/** Check if a C/C++ function_definition is inside a class or struct body
+ *  (and NOT a friend declaration).
  *  Used by cppLabelOverride to skip duplicate function captures
- *  that are already covered by definition.method queries. */
+ *  that are already covered by definition.method queries.
+ *  Friend functions are free functions defined inside class bodies —
+ *  they must NOT be skipped (ISO C++ hidden-friend idiom). */
 function isCppInsideClassOrStruct(functionNode: SyntaxNode): boolean {
   let ancestor: SyntaxNode | null = functionNode?.parent ?? null;
   while (ancestor) {
+    // Friend declarations: the function_definition is wrapped in
+    // `friend_declaration` → `field_declaration_list` → class_specifier.
+    // These are free functions, not methods — don't skip them.
+    if (ancestor.type === 'friend_declaration') return false;
     if (ancestor.type === 'class_specifier' || ancestor.type === 'struct_specifier') return true;
     ancestor = ancestor.parent;
   }
@@ -317,6 +347,38 @@ const cppLabelOverride: NonNullable<LanguageProvider['labelOverride']> = (
 export const cProvider = defineLanguage({
   id: SupportedLanguages.C,
   extensions: ['.c'],
+  entryPointPatterns: [
+    /^main$/,
+    /^init_/,
+    /_init$/,
+    /^start_/,
+    /_start$/,
+    /^run_/,
+    /_run$/,
+    /^stop_/,
+    /_stop$/,
+    /^open_/,
+    /_open$/,
+    /^close_/,
+    /_close$/,
+    /^create_/,
+    /_create$/,
+    /^destroy_/,
+    /_destroy$/,
+    /^handle_/,
+    /_handler$/,
+    /_callback$/,
+    /^cmd_/,
+    /^server_/,
+    /^client_/,
+    /^session_/,
+    /^window_/,
+    /^key_/,
+    /^input_/,
+    /^output_/,
+    /^notify_/,
+    /^control_/,
+  ],
   treeSitterQueries: C_QUERIES,
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
@@ -333,12 +395,61 @@ export const cProvider = defineLanguage({
   heritageExtractor: createHeritageExtractor(SupportedLanguages.C),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
+  emitScopeCaptures: emitCScopeCaptures,
+  interpretImport: interpretCImport,
+  interpretTypeBinding: interpretCTypeBinding,
+  bindingScopeFor: cBindingScopeFor,
+  importOwningScope: cImportOwningScope,
+  receiverBinding: cReceiverBinding,
+  arityCompatibility: cArityCompatibility,
+  // mergeBindings + resolveImportTarget live on ScopeResolver (see c/scope-resolver.ts).
 });
 
 export const cppProvider = defineLanguage({
   id: SupportedLanguages.CPlusPlus,
   extensions: ['.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx', '.hh'],
+  entryPointPatterns: [
+    /^main$/,
+    /^init_/,
+    /_init$/,
+    /^Create[A-Z]/,
+    /^create_/,
+    /^Run$/,
+    /^run$/,
+    /^Start$/,
+    /^start$/,
+    /^handle_/,
+    /_handler$/,
+    /_callback$/,
+    /^OnEvent/,
+    /^on_/,
+    /::Run$/,
+    /::Start$/,
+    /::Init$/,
+    /::Execute$/,
+  ],
+  astFrameworkPatterns: [
+    {
+      framework: 'qt',
+      entryPointMultiplier: 2.8,
+      reason: 'qt-macro',
+      patterns: [
+        'Q_OBJECT',
+        'Q_INVOKABLE',
+        'Q_PROPERTY',
+        'Q_SIGNALS',
+        'Q_SLOTS',
+        'Q_SIGNAL',
+        'Q_SLOT',
+        'QWidget',
+        'QApplication',
+      ],
+    },
+  ] satisfies AstFrameworkPatternConfig[],
   treeSitterQueries: CPP_QUERIES,
+  preprocessSource: stripUeMacros,
   typeConfig: cCppConfig,
   exportChecker: cCppExportChecker,
   importResolver: createImportResolver(cppImportConfig),
@@ -355,4 +466,58 @@ export const cppProvider = defineLanguage({
   heritageExtractor: createHeritageExtractor(SupportedLanguages.CPlusPlus),
   labelOverride: cppLabelOverride,
   builtInNames: C_BUILT_INS,
+  extractTemplateConstraints: extractCppTemplateConstraintsForProvider,
+
+  // ── RFC #909 Ring 3: scope-based resolution hooks (RFC §5) ──────────
+  emitScopeCaptures: emitCppScopeCaptures,
+  interpretImport: interpretCppImport,
+  interpretTypeBinding: interpretCppTypeBinding,
+  bindingScopeFor: cppBindingScopeFor,
+  importOwningScope: cppImportOwningScope,
+  receiverBinding: cppReceiverBinding,
+  arityCompatibility: cppArityCompatibility,
+  // mergeBindings + resolveImportTarget live on ScopeResolver (see cpp/scope-resolver.ts).
 });
+
+/**
+ * LanguageProvider hook: walk from a function definition node up to its
+ * enclosing `template_declaration` and extract the SFINAE / `requires`-
+ * clause constraint payload. Used by `parsing-processor` to fingerprint
+ * the graph node ID so two SFINAE overloads with identical
+ * `parameterTypes` get distinct nodes (issue #1579).
+ *
+ * Returns `undefined` for non-templated functions and for templated
+ * functions whose constraints the extractor can't model — both cases
+ * result in no constraint suffix on the node ID.
+ */
+function extractCppTemplateConstraintsForProvider(definitionNode: SyntaxNode): unknown {
+  // Walk up to the enclosing template_declaration. Bound the walk so we
+  // can't accidentally land on a far-ancestor template_declaration that
+  // wraps an unrelated function.
+  let cur: SyntaxNode | null = definitionNode.parent;
+  let hops = 8;
+  let templateDecl: SyntaxNode | null = null;
+  while (cur !== null && hops-- > 0) {
+    if (cur.type === 'template_declaration') {
+      templateDecl = cur;
+      break;
+    }
+    if (cur.type === 'translation_unit') break;
+    cur = cur.parent;
+  }
+  if (templateDecl === null) return undefined;
+
+  // Find the function_declarator inside the function definition so the
+  // extractor can map template params to function-argument indices.
+  let declarator: SyntaxNode | null = definitionNode.childForFieldName('declarator');
+  let walk = 8;
+  while (declarator !== null && walk-- > 0) {
+    if (declarator.type === 'function_declarator') break;
+    if (declarator.type === 'pointer_declarator' || declarator.type === 'reference_declarator') {
+      declarator = declarator.childForFieldName('declarator');
+      continue;
+    }
+    break;
+  }
+  return extractCppTemplateConstraints(templateDecl, declarator);
+}

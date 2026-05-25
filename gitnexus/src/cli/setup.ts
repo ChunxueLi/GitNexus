@@ -10,6 +10,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import os from 'os';
 import { execFile, execFileSync } from 'child_process';
+import { createRequire } from 'module';
 import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 import { glob } from 'glob';
@@ -19,6 +20,21 @@ import { getGlobalDir } from '../storage/repo-manager.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const execFileAsync = promisify(execFile);
+
+// Pin the npx fallback to the installed version. Reason: setup.ts writes
+// a config that persists in the user's editor and is invoked on every MCP
+// connect. Pinning to the installed version means subsequent invocations
+// skip the npm-registry metadata roundtrip (and stay reproducible until
+// the user upgrades). Static configs and READMEs intentionally use
+// `gitnexus@latest` since they're quickstart docs, not persisted state.
+const _require = createRequire(import.meta.url);
+const _pkg = _require('../../package.json') as { version?: unknown };
+if (typeof _pkg.version !== 'string' || !_pkg.version) {
+  throw new Error(
+    'gitnexus/package.json#version is missing or not a string — cannot generate MCP fallback config.',
+  );
+}
+const NPX_REF = `gitnexus@${_pkg.version}`;
 
 interface SetupResult {
   configured: string[];
@@ -32,15 +48,30 @@ interface SetupResult {
  */
 function resolveGitnexusBin(): string | null {
   try {
-    const cmd = process.platform === 'win32' ? 'where' : 'which';
-    const resolved = execFileSync(cmd, ['gitnexus'], {
+    const isWin = process.platform === 'win32';
+    const cmd = isWin ? 'where' : 'which';
+    const output = execFileSync(cmd, ['gitnexus'], {
       encoding: 'utf-8',
       timeout: 5000,
       stdio: ['ignore', 'pipe', 'ignore'],
-    })
-      .split('\n')[0]
-      .trim();
-    return resolved || null;
+      windowsHide: true,
+    });
+    const lines = output
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+
+    if (isWin) {
+      // On Windows, npm global installs can surface multiple launchers for the
+      // same package (e.g. a POSIX shell shim plus .cmd/.bat wrappers). Claude
+      // and the other MCP hosts need a directly spawnable command path, so only
+      // accept the Windows wrapper. If it is missing, fall back to the slower
+      // npx entry instead of persisting a non-spawnable shim path.
+      const cmdLine = lines.find((l) => /\.(cmd|bat)$/i.test(l));
+      return cmdLine || null;
+    }
+
+    return lines[0] || null;
   } catch {
     return null;
   }
@@ -50,8 +81,10 @@ function resolveGitnexusBin(): string | null {
  * The MCP server entry for all editors.
  *
  * Prefers the globally-installed `gitnexus` binary (starts in ~1 s) over
- * `npx -y gitnexus@latest` (cold-cache install of native deps can take
- * >60 s, exceeding Claude Code's 30 s MCP connection timeout).
+ * `npx -y gitnexus@<version>` (cold-cache install of native deps can take
+ * >60 s, exceeding Claude Code's 30 s MCP connection timeout). The fallback
+ * version is read from gitnexus/package.json#version at module load so the
+ * persisted user config matches the installed package.
  *
  * Falls back to npx when the binary isn't on PATH — e.g. first-time
  * users who ran `npx gitnexus analyze` but haven't done `npm i -g`.
@@ -67,12 +100,12 @@ function getMcpEntry() {
   if (process.platform === 'win32') {
     return {
       command: 'cmd',
-      args: ['/c', 'npx', '-y', 'gitnexus@latest', 'mcp'],
+      args: ['/c', 'npx', '-y', NPX_REF, 'mcp'],
     };
   }
   return {
     command: 'npx',
-    args: ['-y', 'gitnexus@latest', 'mcp'],
+    args: ['-y', NPX_REF, 'mcp'],
   };
 }
 
@@ -88,9 +121,9 @@ function getOpenCodeMcpEntry() {
   }
 
   if (process.platform === 'win32') {
-    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', 'gitnexus@latest', 'mcp'] };
+    return { type: 'local', command: ['cmd', '/c', 'npx', '-y', NPX_REF, 'mcp'] };
   }
-  return { type: 'local', command: ['npx', '-y', 'gitnexus@latest', 'mcp'] };
+  return { type: 'local', command: ['npx', '-y', NPX_REF, 'mcp'] };
 }
 
 /**
@@ -334,8 +367,40 @@ async function installClaudeCodeHooks(result: SetupResult): Promise<void> {
       // Script not found in source — skip
     }
 
+    try {
+      await fs.copyFile(
+        path.join(pluginHooksPath, 'hook-lock.cjs'),
+        path.join(destHooksDir, 'hook-lock.cjs'),
+      );
+    } catch {
+      // Helper not found in source — skip
+    }
+
+    try {
+      await fs.copyFile(
+        path.join(pluginHooksPath, 'hook-db-lock-probe.cjs'),
+        path.join(destHooksDir, 'hook-db-lock-probe.cjs'),
+      );
+    } catch {
+      // Helper not found in source — skip
+    }
+
+    try {
+      await fs.copyFile(
+        path.join(pluginHooksPath, 'win-rm-list-json.ps1'),
+        path.join(destHooksDir, 'win-rm-list-json.ps1'),
+      );
+    } catch {
+      // Helper not found in source — skip
+    }
+
     const hookPath = path.join(destHooksDir, 'gitnexus-hook.cjs').replace(/\\/g, '/');
-    const hookCmd = `node "${hookPath.replace(/"/g, '\\"')}"`;
+    // Escape backslashes FIRST, then quotes (CodeQL js/incomplete-sanitization).
+    // The previous shape `replace(/"/g, '\\"')` alone would let `path\with"quote`
+    // become `path\with\"quote`, where the trailing `\` before `"` could
+    // unescape the quote inside the surrounding double-quoted shell context.
+    const escapedHookPath = hookPath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const hookCmd = `node "${escapedHookPath}"`;
 
     // Check which hook events need entries (idempotent: skip if already registered)
     const parsed = await (async () => {
@@ -468,6 +533,7 @@ async function setupCodex(result: SetupResult): Promise<void> {
     const entry = getMcpEntry();
     await execFileAsync('codex', ['mcp', 'add', 'gitnexus', '--', entry.command, ...entry.args], {
       shell: process.platform === 'win32',
+      windowsHide: true,
     });
     result.configured.push('Codex');
     return;
@@ -592,7 +658,7 @@ async function installOpenCodeSkills(result: SetupResult): Promise<void> {
     const installed = await installSkillsTo(skillsDir);
     if (installed.length > 0) {
       result.configured.push(
-        `OpenCode skills (${installed.length} skills → ~/.config/opencode/skill/)`,
+        `OpenCode skills (${installed.length} skills → ~/.config/opencode/skills/)`,
       );
     }
   } catch (err: any) {

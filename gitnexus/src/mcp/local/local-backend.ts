@@ -14,17 +14,25 @@ import {
   executeParameterized,
   closeLbug,
   isLbugReady,
-  isWriteQuery,
 } from '../../core/lbug/pool-adapter.js';
-export { isWriteQuery };
+import { isValidQueryParams } from '../../core/lbug/query-params.js';
+import { isWalCorruptionError, WAL_RECOVERY_SUGGESTION } from '../../core/lbug/lbug-config.js';
 // Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
 // at MCP server startup — crashes on unsupported Node ABI versions (#89)
 // git utilities available if needed
 // import { isGitRepo, getCurrentCommit, getGitRoot } from '../../storage/git.js';
-import { parseDiffHunks, type FileDiff } from '../../storage/git.js';
+import {
+  parseDiffHunks,
+  getCanonicalRepoRoot,
+  getGitRoot,
+  type FileDiff,
+} from '../../storage/git.js';
+import { realpathSync } from 'fs';
 import {
   listRegisteredRepos,
   cleanupOldKuzuFiles,
+  canonicalizePath,
+  RegistryAmbiguousTargetError,
   type RegistryEntry,
 } from '../../storage/repo-manager.js';
 import { GroupService, type GroupToolPort } from '../../core/group/service.js';
@@ -40,7 +48,8 @@ import {
   isVectorExtensionSupportedByPlatform,
 } from '../../core/platform/capabilities.js';
 import { PhaseTimer } from '../../core/search/phase-timer.js';
-import { checkStaleness, checkCwdMatch } from '../../core/git-staleness.js';
+import { checkStalenessAsync, checkCwdMatch } from '../../core/git-staleness.js';
+import { logger } from '../../core/logger.js';
 // AI context generation is CLI-only (gitnexus analyze)
 // import { generateAIContextFiles } from '../../cli/ai-context.js';
 
@@ -164,29 +173,30 @@ const confidenceForRelType = (relType: string | undefined): number =>
 /** Structured error logging for query failures — replaces empty catch blocks */
 function logQueryError(context: string, err: unknown): void {
   const msg = err instanceof Error ? err.message : String(err);
-  console.error(`GitNexus [${context}]: ${msg}`);
+  logger.error({ context, err: msg }, 'GitNexus query failed');
 }
 
+const isReadOnlyDbError = (err: unknown): boolean =>
+  /read-only database/i.test(err instanceof Error ? err.message : String(err));
+
 /**
- * Structured per-query latency log for production aggregation (#553).
+ * Per-query latency telemetry for production aggregation (#553).
  *
- * Emitted on stderr — NOT stdout — because the MCP stdio transport uses
- * stdout exclusively for JSON-RPC responses (#324), and the CLI e2e test
- * `tool output goes to stdout via fd 1` asserts that stdout parses cleanly
- * as JSON. Any `console.log` from inside a tool handler would corrupt the
- * protocol. Matches the existing `logQueryError` convention above, which
- * uses stderr for the same reason.
+ * Logged at `debug` level — timing is observability/telemetry, not an
+ * error. Operators wanting per-query timing set `GITNEXUS_LOG_LEVEL=debug`
+ * (or equivalent). Emitting at `error` level (the original migration
+ * artifact) caused alerting rules to fire on every successful query and
+ * inflated stderr noise for every MCP/CLI invocation.
  *
- * The `GitNexus [query:timing] …` prefix keeps lines greppable; the
- * `phases` payload is JSON so log-scraping pipelines can parse it
- * without custom format knowledge.
+ * Emitted via the project logger which routes to stderr — never stdout —
+ * because the MCP stdio transport uses stdout exclusively for JSON-RPC
+ * responses (#324) and the CLI e2e test `tool output goes to stdout via
+ * fd 1` asserts stdout parses cleanly as JSON.
  */
 function logQueryTiming(query: string, phases: Record<string, number>): void {
   const totalMs = phases.wall ?? Object.values(phases).reduce((a, b) => a + b, 0);
   const truncated = query.length > 80 ? `${query.slice(0, 80)}…` : query;
-  console.error(
-    `GitNexus [query:timing] query=${JSON.stringify(truncated)} totalMs=${totalMs} phases=${JSON.stringify(phases)}`,
-  );
+  logger.debug({ query: truncated, totalMs, phases }, 'GitNexus query timing');
 }
 
 export interface CodebaseContext {
@@ -210,6 +220,89 @@ interface RepoHandle {
   remoteUrl?: string;
   stats?: RegistryEntry['stats'];
 }
+
+/** Resolve symlinks for path comparison; falls back to path.resolve on error.
+ * Uses `realpathSync.native` (not the pure-JS `realpathSync`) so that Windows
+ * 8.3 short names (e.g. RUNNER~1 → runneradmin) are expanded to long form,
+ * matching the output of `git rev-parse --show-toplevel`. */
+function tryRealpath(p: string): string {
+  try {
+    return realpathSync.native(p);
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/**
+ * Resolve the git diff cwd for detect_changes, auto-detecting linked worktrees.
+ *
+ * When `launchCwd` is a linked worktree of the same canonical repository as
+ * `repoPath` (i.e. `getGitRoot(launchCwd)` differs from `repoPath` but both
+ * share the same `getCanonicalRepoRoot`), returns the worktree's git root so
+ * that `git diff` sees the correct working directory and index.
+ *
+ * Returns `repoPath` unchanged in all other cases (non-worktree, git
+ * unavailable, unrelated repo).
+ *
+ * Extracted as a module-level export so tests can pass any `launchCwd` instead
+ * of relying on `process.cwd()`, which is fixed to the server launch directory
+ * and cannot be changed mid-process.
+ */
+export function resolveWorktreeCwd(repoPath: string, launchCwd: string): string {
+  try {
+    // Verify repoPath is a git root before comparing against its canonical
+    // root. If getGitRoot returns a different path, repoPath is an arbitrary
+    // subdirectory — skip both the linked-worktree guard and auto-detection
+    // and fall through to the repoPath fallback.
+    const repoGitRoot = getGitRoot(repoPath);
+    const repoCanonical =
+      repoGitRoot && tryRealpath(repoGitRoot) === tryRealpath(repoPath)
+        ? getCanonicalRepoRoot(repoPath)
+        : null;
+
+    // Early exit: if repoPath is a linked worktree (differs from its canonical
+    // main-checkout root), return it unchanged. Do NOT override it with the
+    // server's launch directory — that would silently replace the explicitly-
+    // resolved worktree index with the main checkout.
+    //
+    // getCanonicalRepoRoot returns the main-checkout path for both the checkout
+    // and all linked worktrees:
+    //   repoPath === canonical → main checkout (auto-detect may fire below)
+    //   repoPath !== canonical → linked worktree (return as-is)
+    if (repoCanonical && tryRealpath(repoPath) !== tryRealpath(repoCanonical)) {
+      return repoPath;
+    }
+
+    const launchGitRoot = getGitRoot(launchCwd);
+    if (launchGitRoot) {
+      // Normalise via realpathSync before comparing so macOS /var → /private/var
+      // symlinks (and Windows 8.3 short names) don't create false mismatches.
+      const realLaunch = tryRealpath(launchGitRoot);
+      const realRepo = tryRealpath(repoPath);
+      if (realLaunch !== realRepo) {
+        const launchCanonical = getCanonicalRepoRoot(launchCwd);
+        // Use tryRealpath on both canonical values for cross-platform safety.
+        if (
+          launchCanonical &&
+          repoCanonical &&
+          tryRealpath(launchCanonical) === tryRealpath(repoCanonical)
+        ) {
+          return launchGitRoot;
+        }
+      }
+    }
+  } catch {
+    // Best-effort; fall through to repoPath.
+  }
+  return repoPath;
+}
+
+/**
+ * Length of the base64url path hash appended to a colliding repo id.
+ * Exported so tests can pin the suffix shape without re-deriving the
+ * literal; see `repoId()` and the hashed-id resolution tier (#1658).
+ */
+export const REPO_ID_HASH_LENGTH = 6;
 
 export class LocalBackend {
   private repos: Map<string, RepoHandle> = new Map();
@@ -287,7 +380,7 @@ export class LocalBackend {
       // If kuzu exists but lbug doesn't, warn so the user knows to re-analyze.
       const kuzu = await cleanupOldKuzuFiles(storagePath);
       if (kuzu.found && kuzu.needsReindex) {
-        console.error(
+        logger.error(
           `GitNexus: "${entry.name}" has a stale KuzuDB index. Run: gitnexus analyze ${entry.path}`,
         );
       }
@@ -339,7 +432,13 @@ export class LocalBackend {
     for (const [id, handle] of this.repos) {
       if (id === base && handle.repoPath !== path.resolve(repoPath)) {
         // Collision — use path hash
-        const hash = Buffer.from(repoPath).toString('base64url').slice(0, 6);
+        // Lowercase the hash so it survives the `paramLower` lookup in
+        // resolveRepoFromCache — base64url retains mixed case, but the id
+        // tier compares against `repoParam.toLowerCase()` (#1658 follow-up).
+        const hash = Buffer.from(repoPath)
+          .toString('base64url')
+          .slice(0, REPO_ID_HASH_LENGTH)
+          .toLowerCase();
         return `${base}-${hash}`;
       }
     }
@@ -358,7 +457,19 @@ export class LocalBackend {
    * while the MCP server was running.
    */
   async resolveRepo(repoParam?: string): Promise<RepoHandle> {
-    const result = this.resolveRepoFromCache(repoParam);
+    let refreshedAfterAmbiguity = false;
+    let result: RepoHandle | null;
+    try {
+      result = this.resolveRepoFromCache(repoParam);
+    } catch (err) {
+      if (!(err instanceof RegistryAmbiguousTargetError)) throw err;
+      // Stale in-memory duplicate siblings can linger after unregister; refresh
+      // once before re-throwing so a resolved registry can disambiguate (#1658).
+      await this.refreshRepos();
+      refreshedAfterAmbiguity = true;
+      result = this.resolveRepoFromCache(repoParam);
+    }
+
     if (result) {
       // Issue: silent graph drift across sibling clones.
       // If the caller's cwd lives in a *different* on-disk clone of
@@ -372,8 +483,10 @@ export class LocalBackend {
       return result;
     }
 
-    // Miss — refresh registry and try once more
-    await this.refreshRepos();
+    // Miss — refresh registry and try once more (skip if already refreshed above)
+    if (!refreshedAfterAmbiguity) {
+      await this.refreshRepos();
+    }
     const retried = this.resolveRepoFromCache(repoParam);
     if (retried) {
       this.maybeWarnSiblingDrift(retried).catch(() => {});
@@ -408,27 +521,66 @@ export class LocalBackend {
 
   /**
    * Try to resolve a repo from the in-memory cache. Returns null on miss.
+   * Throws {@link RegistryAmbiguousTargetError} when `repoParam` matches
+   * multiple handles by name and cwd cannot disambiguate (#1658).
    */
   private resolveRepoFromCache(repoParam?: string): RepoHandle | null {
     if (this.repos.size === 0) return null;
 
     if (repoParam) {
       const paramLower = repoParam.toLowerCase();
-      // Match by id
+      const looksLikePath =
+        path.isAbsolute(repoParam) || repoParam.includes(path.sep) || repoParam.includes('/');
+
+      const resolvePathMatch = (): RepoHandle | undefined => {
+        const canonicalTarget = canonicalizePath(repoParam);
+        return [...this.repos.values()].find((handle) => {
+          const stored = canonicalizePath(handle.repoPath);
+          return process.platform === 'win32'
+            ? stored.toLowerCase() === canonicalTarget.toLowerCase()
+            : stored === canonicalTarget;
+        });
+      };
+
+      // Path-like params first (absolute or contains separators) — aligns with
+      // resolveRegistryEntry (#829). Bare aliases such as ".tmp-repro-mini" must
+      // not be resolved via path.resolve(cwd) before duplicate-name handling.
+      if (looksLikePath) {
+        const pathMatch = resolvePathMatch();
+        if (pathMatch) return pathMatch;
+      }
+
+      // Exact name before id — the first duplicate sibling keeps id === name
+      // (e.g. id "shared"), so a name lookup must not be captured by the id tier.
+      const nameMatches = [...this.repos.values()].filter(
+        (handle) => handle.name.toLowerCase() === paramLower,
+      );
+      if (nameMatches.length === 1) return nameMatches[0];
+      if (nameMatches.length > 1) {
+        const cwdPick = this.pickRepoHandleForCwd(nameMatches);
+        if (cwdPick) return cwdPick;
+        throw new RegistryAmbiguousTargetError(
+          repoParam,
+          nameMatches.map((h) => this.handleToRegistryEntry(h)),
+        );
+      }
+
+      // Stable hashed id (e.g. "shared-abc123") from repoId() collision suffix
       if (this.repos.has(paramLower)) return this.repos.get(paramLower)!;
-      // Match by name (case-insensitive)
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase() === paramLower) return handle;
+
+      // Bare name resolved as a cwd-relative path (e.g. "myrepo" against process.cwd()),
+      // after name/id tiers. Path-like strings with separators were handled at the top.
+      if (!looksLikePath) {
+        const pathMatch = resolvePathMatch();
+        if (pathMatch) return pathMatch;
       }
-      // Match by path (substring)
-      const resolved = path.resolve(repoParam);
-      for (const handle of this.repos.values()) {
-        if (handle.repoPath === resolved) return handle;
-      }
-      // Match by partial name
-      for (const handle of this.repos.values()) {
-        if (handle.name.toLowerCase().includes(paramLower)) return handle;
-      }
+
+      // Partial name — only when unambiguous
+      const partialMatches = [...this.repos.values()].filter((handle) =>
+        handle.name.toLowerCase().includes(paramLower),
+      );
+      if (partialMatches.length === 1) return partialMatches[0];
+
       return null;
     }
 
@@ -437,6 +589,39 @@ export class LocalBackend {
     }
 
     return null; // Multiple repos, no param — ambiguous
+  }
+
+  /**
+   * Prefer the indexed repo whose path matches the git root of process.cwd().
+   *
+   * In MCP stdio server mode, `process.cwd()` is the server's launch directory,
+   * not the agent client's cwd. If the server was started from an unrelated
+   * directory, `getGitRoot` returns null and duplicate-name resolution throws
+   * {@link RegistryAmbiguousTargetError} — callers should pass an absolute path.
+   */
+  private pickRepoHandleForCwd(candidates: RepoHandle[]): RepoHandle | null {
+    const cwdRoot = getGitRoot(process.cwd());
+    if (!cwdRoot) return null;
+    const canonicalCwd = canonicalizePath(cwdRoot);
+    const cwdMatches = candidates.filter((handle) => {
+      const stored = canonicalizePath(handle.repoPath);
+      return process.platform === 'win32'
+        ? stored.toLowerCase() === canonicalCwd.toLowerCase()
+        : stored === canonicalCwd;
+    });
+    return cwdMatches.length === 1 ? cwdMatches[0] : null;
+  }
+
+  private handleToRegistryEntry(handle: RepoHandle): RegistryEntry {
+    return {
+      name: handle.name,
+      path: handle.repoPath,
+      storagePath: handle.storagePath,
+      indexedAt: handle.indexedAt,
+      lastCommit: handle.lastCommit,
+      stats: handle.stats,
+      remoteUrl: handle.remoteUrl,
+    };
   }
 
   // ─── Lazy LadybugDB Init ────────────────────────────────────────────
@@ -555,8 +740,15 @@ export class LocalBackend {
       byRemote.set(h.remoteUrl, list);
     }
 
-    return handles.map((h) => {
-      const stale = checkStaleness(h.repoPath, h.lastCommit);
+    // Check staleness for all repos in parallel instead of sequentially.
+    // Each check spawns an async `git rev-list` — with 200 repos the sync
+    // variant took ~50 s; parallel async brings it under a second (#1363).
+    const stalenessResults = await Promise.all(
+      handles.map((h) => checkStalenessAsync(h.repoPath, h.lastCommit)),
+    );
+
+    return handles.map((h, i) => {
+      const stale = stalenessResults[i];
       const selfNorm = norm(h.repoPath);
       const siblings = h.remoteUrl
         ? (byRemote.get(h.remoteUrl) ?? []).filter((e) => norm(e.repoPath) !== selfNorm)
@@ -637,7 +829,7 @@ export class LocalBackend {
     }
 
     this.warnedSiblingDrift.add(cacheKey);
-    console.error(`GitNexus: ${match.hint}`);
+    logger.error(`GitNexus: ${match.hint}`);
   }
 
   // ─── Tool Dispatch ───────────────────────────────────────────────
@@ -748,8 +940,10 @@ export class LocalBackend {
       timer.time('vector', this.semanticSearch(repo, searchQuery, searchLimit)),
     ]);
 
-    const bm25Results = bm25SearchResult.results;
-    const ftsUsed = bm25SearchResult.ftsUsed;
+    // Guard against undefined results (#1489) — when FTS is entirely
+    // unavailable the search helper may return an unexpected shape.
+    const bm25Results = bm25SearchResult?.results ?? [];
+    const ftsUsed = bm25SearchResult?.ftsUsed ?? false;
 
     // Merge via reciprocal rank fusion
     timer.start('merge');
@@ -767,8 +961,9 @@ export class LocalBackend {
       }
     }
 
-    for (let i = 0; i < semanticResults.length; i++) {
-      const result = semanticResults[i];
+    const safeSemanticResults = semanticResults ?? [];
+    for (let i = 0; i < safeSemanticResults.length; i++) {
+      const result = safeSemanticResults[i];
       const key = result.nodeId || result.filePath;
       const rrfScore = 1 / (60 + i);
       const existing = scoreMap.get(key);
@@ -972,7 +1167,7 @@ export class LocalBackend {
       timing,
       ...(!ftsUsed && {
         warning:
-          'FTS extension unavailable - keyword search degraded. Run: gitnexus analyze --force to rebuild indexes.',
+          'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.',
       }),
     };
   }
@@ -985,16 +1180,32 @@ export class LocalBackend {
     query: string,
     limit: number,
   ): Promise<{ results: any[]; ftsUsed: boolean }> {
-    const { searchFTSFromLbug } = await import('../../core/search/bm25-index.js');
-    let bm25Results;
+    let searchFTSFromLbug;
     try {
-      bm25Results = await searchFTSFromLbug(query, limit, repo.id);
+      ({ searchFTSFromLbug } = await import('../../core/search/bm25-index.js'));
     } catch (err: any) {
-      console.error('GitNexus: BM25/FTS search failed (FTS indexes may not exist) -', err.message);
+      // Module import can fail in sandboxed MCP contexts (#1489)
+      logger.warn(
+        { err: err?.message },
+        'GitNexus: bm25-index.js import failed — falling back to semantic-only',
+      );
+      return { results: [], ftsUsed: false };
+    }
+    let ftsResponse;
+    try {
+      ftsResponse = await searchFTSFromLbug(query, limit, repo.id);
+    } catch (err: any) {
+      logger.error(
+        { err: err.message },
+        'GitNexus: BM25/FTS search failed (FTS indexes may not exist) -',
+      );
       return { results: [], ftsUsed: false };
     }
 
-    const ftsUsed = bm25Results.length === 0 || bm25Results[0]?.ftsUsed !== false;
+    // Guard against unexpected response shape (#1489) — ftsResponse.results
+    // could be undefined when the FTS extension is unavailable in the MCP process.
+    const bm25Results = ftsResponse?.results ?? [];
+    const ftsUsed = ftsResponse?.ftsAvailable ?? false;
 
     const results: any[] = [];
 
@@ -1114,7 +1325,7 @@ export class LocalBackend {
         // policy. Emitted once per `LocalBackend` instance lifetime to avoid
         // noisy stderr on hot semantic-search paths (DoD §2.8).
         this.warnedVectorUnsupported = true;
-        console.error(
+        logger.warn(
           'GitNexus [query:vector]: VECTOR extension not supported on this platform; using exact scan fallback',
         );
       }
@@ -1192,31 +1403,48 @@ export class LocalBackend {
     }
   }
 
-  async executeCypher(repoName: string, query: string): Promise<any> {
+  async executeCypher(
+    repoName: string,
+    query: string,
+    params: Record<string, unknown> = {},
+  ): Promise<any> {
     const repo = await this.resolveRepo(repoName);
-    return this.cypher(repo, { query });
+    return this.cypher(repo, { query, params });
   }
 
-  private async cypher(repo: RepoHandle, params: { query: string }): Promise<any> {
+  private async cypher(
+    repo: RepoHandle,
+    request: { query: string; params?: Record<string, unknown> },
+  ): Promise<any> {
     await this.ensureInitialized(repo.id);
 
     if (!isLbugReady(repo.id)) {
       return { error: 'LadybugDB not ready. Index may be corrupted.' };
     }
-
-    // Block write operations (defense-in-depth — DB is already read-only)
-    if (isWriteQuery(params.query)) {
+    if (request.params !== undefined && !isValidQueryParams(request.params)) {
       return {
-        error:
-          'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.',
+        error: '"params" must be a plain object with scalar values (string/number/boolean/null).',
       };
     }
 
     try {
-      const result = await executeQuery(repo.id, params.query);
+      const result = await executeParameterized(repo.id, request.query, request.params ?? {});
       return result;
     } catch (err: any) {
-      return { error: err.message || 'Query failed' };
+      const msg = err.message || 'Query failed';
+      if (isReadOnlyDbError(err)) {
+        return {
+          error:
+            'Write operations (CREATE, DELETE, SET, MERGE, REMOVE, DROP, ALTER, COPY, DETACH) are not allowed. The knowledge graph is read-only.',
+        };
+      }
+      if (isWalCorruptionError(err)) {
+        return {
+          error: msg,
+          recoverySuggestion: WAL_RECOVERY_SUGGESTION,
+        };
+      }
+      return { error: msg };
     }
   }
 
@@ -1671,6 +1899,30 @@ export class LocalBackend {
       include_content?: boolean;
     },
   ): Promise<any> {
+    try {
+      return await this._contextImpl(repo, params);
+    } catch (err: any) {
+      const msg = (err instanceof Error ? err.message : String(err)) || 'Context query failed';
+      if (isWalCorruptionError(err)) {
+        return {
+          error: msg,
+          recoverySuggestion: WAL_RECOVERY_SUGGESTION,
+        };
+      }
+      throw err;
+    }
+  }
+
+  private async _contextImpl(
+    repo: RepoHandle,
+    params: {
+      name?: string;
+      uid?: string;
+      file_path?: string;
+      kind?: string;
+      include_content?: boolean;
+    },
+  ): Promise<any> {
     await this.ensureInitialized(repo.id);
 
     const { name, uid, file_path, kind, include_content } = params;
@@ -1714,12 +1966,13 @@ export class LocalBackend {
       repo.id,
       `
       MATCH (caller)-[r:CodeRelation]->(n {id: $symId})
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
       LIMIT 30
     `,
       { symId },
     );
+    let typedPropertyRows: any[] = [];
 
     // Fix #480: Class/Interface nodes have no direct CALLS/IMPORTS edges —
     // those point to Constructor and File nodes respectively. Fetch those
@@ -1753,23 +2006,24 @@ export class LocalBackend {
 
     if (isClassLike) {
       try {
-        // Run both incoming-ref queries in parallel — they are independent.
-        const [ctorIncoming, fileIncoming] = await Promise.all([
-          executeParameterized(
-            repo.id,
-            `
+        // Run incoming-ref queries in parallel — they are independent.
+        const [ctorIncoming, fileIncoming, typedPropertyIncoming, typedProperties] =
+          await Promise.all([
+            executeParameterized(
+              repo.id,
+              `
             MATCH (n)-[hm:CodeRelation]->(ctor:Constructor)
             WHERE n.id = $symId AND hm.type = 'HAS_METHOD'
             MATCH (caller)-[r:CodeRelation]->(ctor)
-            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'ACCESSES']
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `,
-            { symId },
-          ),
-          executeParameterized(
-            repo.id,
-            `
+              { symId },
+            ),
+            executeParameterized(
+              repo.id,
+              `
             MATCH (f:File)-[rel:CodeRelation]->(n)
             WHERE n.id = $symId AND rel.type = 'DEFINES'
             MATCH (caller)-[r:CodeRelation]->(f)
@@ -1777,9 +2031,45 @@ export class LocalBackend {
             RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
             LIMIT 30
           `,
-            { symId },
-          ),
-        ]);
+              { symId },
+            ),
+            executeParameterized(
+              repo.id,
+              `
+            MATCH (p:\`Property\`)
+            WHERE p.declaredType = $name
+               OR p.declaredType STARTS WITH $genericPrefix
+               OR p.declaredType CONTAINS $genericArg
+            MATCH (caller)-[r:CodeRelation]->(p)
+            WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'ACCESSES']
+            RETURN r.type AS relType, caller.id AS uid, caller.name AS name, caller.filePath AS filePath, labels(caller)[0] AS kind
+            LIMIT 30
+          `,
+              {
+                name: sym.name,
+                genericPrefix: `${sym.name}<`,
+                genericArg: `<${sym.name}>`,
+              },
+            ),
+            executeParameterized(
+              repo.id,
+              `
+            MATCH (p:\`Property\`)
+            WHERE p.declaredType = $name
+               OR p.declaredType STARTS WITH $genericPrefix
+               OR p.declaredType CONTAINS $genericArg
+            RETURN p.id AS uid, p.name AS name, p.filePath AS filePath, labels(p)[0] AS kind,
+                   p.declaredType AS declaredType
+            LIMIT 30
+          `,
+              {
+                name: sym.name,
+                genericPrefix: `${sym.name}<`,
+                genericArg: `<${sym.name}>`,
+              },
+            ),
+          ]);
+        typedPropertyRows = typedProperties;
 
         // Deduplicate by (relType, uid) — a caller can have multiple relation
         // types to the same target (e.g. both IMPORTS and CALLS), and each
@@ -1787,7 +2077,7 @@ export class LocalBackend {
         const seenKeys = new Set(
           incomingRows.map((r: any) => `${r.relType || r[0]}:${r.uid || r[1]}`),
         );
-        for (const r of [...ctorIncoming, ...fileIncoming]) {
+        for (const r of [...ctorIncoming, ...fileIncoming, ...typedPropertyIncoming]) {
           const key = `${r.relType || r[0]}:${r.uid || r[1]}`;
           if (!seenKeys.has(key)) {
             seenKeys.add(key);
@@ -1804,7 +2094,7 @@ export class LocalBackend {
       repo.id,
       `
       MATCH (n {id: $symId})-[r:CodeRelation]->(target)
-      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
+      WHERE r.type IN ['CALLS', 'IMPORTS', 'EXTENDS', 'IMPLEMENTS', 'USES', 'HAS_METHOD', 'HAS_PROPERTY', 'METHOD_OVERRIDES', 'OVERRIDES', 'METHOD_IMPLEMENTS', 'ACCESSES']
       RETURN r.type AS relType, target.id AS uid, target.name AS name, target.filePath AS filePath, labels(target)[0] AS kind
       LIMIT 30
     `,
@@ -1893,6 +2183,17 @@ export class LocalBackend {
       },
       incoming: categorize(incomingRows),
       outgoing: categorize(outgoingRows),
+      ...(typedPropertyRows.length > 0
+        ? {
+            typed_properties: typedPropertyRows.map((r: any) => ({
+              uid: r.uid || r[0],
+              name: r.name || r[1],
+              filePath: r.filePath || r[2],
+              kind: r.kind || r[3],
+              declaredType: r.declaredType || r[4],
+            })),
+          }
+        : {}),
       processes: processRows.map((r: any) => ({
         id: r.pid || r[0],
         name: r.label || r[1],
@@ -2027,6 +2328,7 @@ export class LocalBackend {
     params: {
       scope?: string;
       base_ref?: string;
+      worktree?: string;
     },
   ): Promise<any> {
     await this.ensureInitialized(repo.id);
@@ -2055,13 +2357,54 @@ export class LocalBackend {
 
     let diffOutput: string;
     try {
+      // Resolve the cwd for git diff.
+      //
+      // In a linked worktree (e.g. /repo/wt-feature/), the user's staged and
+      // unstaged changes live in that worktree's separate working directory and
+      // index. Running `git diff` from the canonical repo root sees a different
+      // working tree and returns empty output.
+      //
+      // Resolution order (see resolveWorktreeCwd for details):
+      //   1. params.worktree — explicit override, validated against the
+      //      registered repo's canonical root.
+      //   2. Auto-detect — if the server's launch cwd (process.cwd()) is a
+      //      linked worktree of the same canonical repo, use its git root.
+      //   3. repo.repoPath — fallback (original behaviour, handled inside
+      //      resolveWorktreeCwd when no worktree is detected).
+      //
+      // Start with the auto-detected value; override with the validated
+      // explicit param when provided. This avoids a dead initial assignment.
+      let diffCwd = resolveWorktreeCwd(repo.repoPath, process.cwd());
+      if (params.worktree) {
+        if (!path.isAbsolute(params.worktree)) {
+          return {
+            error: `worktree must be an absolute path, got: "${params.worktree}"`,
+          };
+        }
+        const providedResolved = path.resolve(params.worktree);
+        const repoCanonical = getCanonicalRepoRoot(repo.repoPath);
+        if (!repoCanonical) {
+          return {
+            error: `Could not determine canonical root for repo "${repo.repoPath}". Is git available?`,
+          };
+        }
+        const worktreeCanonical = getCanonicalRepoRoot(providedResolved);
+        if (!worktreeCanonical || tryRealpath(worktreeCanonical) !== tryRealpath(repoCanonical)) {
+          return {
+            error: `worktree "${params.worktree}" is not a worktree of repo "${repo.repoPath}". Ensure the path is inside the same git repository.`,
+          };
+        }
+        diffCwd = providedResolved;
+      }
+
       // maxBuffer raised from Node's 1MB default to 256MB to avoid ENOBUFS on
       // repos with large unstaged/untracked diffs (e.g. unignored build folders).
       // See issue: spawnSync git ENOBUFS in detect_changes(scope="unstaged").
       diffOutput = execFileSync('git', diffArgs, {
-        cwd: repo.repoPath,
+        cwd: diffCwd,
         encoding: 'utf-8',
         maxBuffer: 256 * 1024 * 1024,
+        windowsHide: true,
       });
     } catch (err: any) {
       return { error: `Git diff failed: ${err.message}` };
@@ -2338,6 +2681,7 @@ export class LocalBackend {
         timeout: 5000,
         // Avoid ENOBUFS on large repos: rg -l can list many files.
         maxBuffer: 256 * 1024 * 1024,
+        windowsHide: true,
       });
       const files = output
         .trim()
@@ -2431,6 +2775,7 @@ export class LocalBackend {
         impactedCount: 0,
         risk: 'UNKNOWN',
         suggestion: 'The graph query failed — try gitnexus context <symbol> as a fallback',
+        ...(isWalCorruptionError(err) ? { recoverySuggestion: WAL_RECOVERY_SUGGESTION } : {}),
       };
     }
   }
@@ -2457,6 +2802,7 @@ export class LocalBackend {
     const mappedRelTypes = params.relationTypes?.flatMap((t: string) =>
       t === 'OVERRIDES' ? ['OVERRIDES', 'METHOD_OVERRIDES'] : [t],
     );
+    const hasExplicitRelationTypes = mappedRelTypes !== undefined && mappedRelTypes.length > 0;
     const rawRelTypes =
       mappedRelTypes && mappedRelTypes.length > 0
         ? mappedRelTypes.filter((t: string) => VALID_RELATION_TYPES.has(t))
@@ -2465,6 +2811,7 @@ export class LocalBackend {
             'IMPORTS',
             'EXTENDS',
             'IMPLEMENTS',
+            'USES',
             'METHOD_OVERRIDES',
             'OVERRIDES',
             'METHOD_IMPLEMENTS',
@@ -2477,6 +2824,7 @@ export class LocalBackend {
             'IMPORTS',
             'EXTENDS',
             'IMPLEMENTS',
+            'USES',
             'METHOD_OVERRIDES',
             'OVERRIDES',
             'METHOD_IMPLEMENTS',
@@ -2536,9 +2884,16 @@ export class LocalBackend {
     };
     const symType = outcome.resolvedLabel || outcome.symbol.type || '';
 
+    const effectiveRelationTypes =
+      (symType === 'Class' || symType === 'Interface') &&
+      !hasExplicitRelationTypes &&
+      !relationTypes.includes('ACCESSES')
+        ? [...relationTypes, 'ACCESSES']
+        : relationTypes;
+
     return this._runImpactBFS(repo, sym, symType, direction, {
       maxDepth,
-      relationTypes,
+      relationTypes: effectiveRelationTypes,
       includeTests,
       minConfidence,
     });
@@ -2611,6 +2966,30 @@ export class LocalBackend {
           }
         }
         for (const r of fileRows) {
+          const rid = r.id || r[0];
+          if (rid && !visited.has(rid)) {
+            visited.add(rid);
+            frontier.push(rid);
+          }
+        }
+
+        const typedPropertyRows = await executeParameterized(
+          repo.id,
+          `
+          MATCH (p:\`Property\`)
+          WHERE p.declaredType = $name
+             OR p.declaredType STARTS WITH $genericPrefix
+             OR p.declaredType CONTAINS $genericArg
+          RETURN p.id AS id, p.name AS name, labels(p)[0] AS type, p.filePath AS filePath
+        `,
+          {
+            name: sym.name,
+            genericPrefix: `${sym.name}<`,
+            genericArg: `<${sym.name}>`,
+          },
+        );
+
+        for (const r of typedPropertyRows) {
           const rid = r.id || r[0];
           if (rid && !visited.has(rid)) {
             visited.add(rid);
@@ -2982,8 +3361,14 @@ export class LocalBackend {
       relationTypes: string[];
       minConfidence: number;
       includeTests: boolean;
+      signal?: AbortSignal;
     },
   ): Promise<any | null> {
+    // Honor an already-aborted signal at the entry boundary as a fast
+    // path. Cooperative cancellation inside _runImpactBFS is out of
+    // scope — the caller's Promise.race against the same signal
+    // resolves the await regardless of how long this body runs.
+    if (opts.signal?.aborted) return null;
     try {
       await this.refreshRepos();
       await this.ensureInitialized(repoId);
