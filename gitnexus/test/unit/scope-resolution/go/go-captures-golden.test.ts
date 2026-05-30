@@ -128,11 +128,40 @@ function formatGolden(snap: Snapshot): string {
   return JSON.stringify(snap, null, 2) + '\n';
 }
 
+/**
+ * Pure decision for what the golden test should do — extracted so the
+ * fail-on-missing-in-CI rule is unit-testable without touching the filesystem
+ * (and can never corrupt the committed golden). A missing golden must NOT
+ * self-heal in CI; locally it regenerates as a first-run convenience.
+ */
+type GoldenAction = 'regenerate' | 'compare' | 'fail';
+function resolveGoldenAction(opts: {
+  update: boolean;
+  exists: boolean;
+  isCI: boolean;
+}): GoldenAction {
+  if (opts.update) return 'regenerate';
+  if (!opts.exists) return opts.isCI ? 'fail' : 'regenerate';
+  return 'compare';
+}
+
 describe('Go scope captures — golden parity', () => {
   it('matches the committed golden snapshot across all go-* fixtures + DAO shape', () => {
     const snapshot = buildSnapshot();
+    const action = resolveGoldenAction({
+      update: UPDATE,
+      exists: fs.existsSync(GOLDEN_FILE),
+      isCI: !!process.env.CI, // truthy check: fires on any CI runner, not just CI==='true'
+    });
 
-    if (UPDATE || !fs.existsSync(GOLDEN_FILE)) {
+    if (action === 'fail') {
+      throw new Error(
+        `[go-captures-golden] golden file missing at ${GOLDEN_FILE} in CI. A missing golden must ` +
+          `not self-heal in CI — regenerate it locally with UPDATE_GOLDEN=1 and commit it.`,
+      );
+    }
+
+    if (action === 'regenerate') {
       fs.mkdirSync(GOLDEN_DIR, { recursive: true });
       fs.writeFileSync(GOLDEN_FILE, formatGolden(snapshot), 'utf8');
       console.log(
@@ -144,9 +173,21 @@ describe('Go scope captures — golden parity', () => {
     const expected: Snapshot = JSON.parse(fs.readFileSync(GOLDEN_FILE, 'utf8'));
     expect(
       snapshot,
-      'emitGoScopeCaptures output drifted from the committed golden. If this drift is intentional, ' +
-        'regenerate with UPDATE_GOLDEN=1 npx vitest run test/unit/scope-resolution/go/go-captures-golden.test.ts',
+      'emitGoScopeCaptures output drifted from the committed golden. If this drift is intentional ' +
+        '(or the digest scheme changed), regenerate with ' +
+        'UPDATE_GOLDEN=1 npx vitest run test/unit/scope-resolution/go/go-captures-golden.test.ts',
     ).toEqual(expected);
+  });
+
+  // The fail-on-missing-in-CI rule, asserted purely (no filesystem mutation).
+  it.each([
+    { update: true, exists: false, isCI: true, expected: 'regenerate' },
+    { update: false, exists: false, isCI: true, expected: 'fail' },
+    { update: false, exists: false, isCI: false, expected: 'regenerate' },
+    { update: false, exists: true, isCI: true, expected: 'compare' },
+    { update: false, exists: true, isCI: false, expected: 'compare' },
+  ])('resolveGoldenAction($update,$exists,$isCI) -> $expected', ({ update, exists, isCI, expected }) => {
+    expect(resolveGoldenAction({ update, exists, isCI })).toBe(expected);
   });
 
   it('produces a deterministic digest across repeated runs', () => {
