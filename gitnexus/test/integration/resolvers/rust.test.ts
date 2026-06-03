@@ -2067,7 +2067,8 @@ describe('Rust scoped inherent impl — ownership + collision (issue #1975)', ()
 // is separate machinery tracked as a follow-up. C++/Ruby land first (KTD-6).
 // ---------------------------------------------------------------------------
 
-// eslint-disable-next-line vitest/no-disabled-tests -- deferred follow-up (see above)
+// Skipped: Rust inherent-impl ownership is deferred to the resolution-side
+// follow-up (see the comment block above). Tracked in the #1978 follow-up issue.
 describe.skip('Rust inline mod-nested same-tail collision — distinct nodes (issue #1978)', () => {
   let result: PipelineResult;
 

@@ -255,8 +255,15 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
   ruby: new Set<string>([
     // Ruby scope-resolution currently achieves 89/127 parity.
     // Tests listed here are scope-resolver-only correctness wins
-    // (pass under registry-primary, fail under legacy). Currently
-    // empty — all 127 tests pass under legacy mode.
+    // (pass under registry-primary, fail under legacy).
+    //
+    // #1978 qualified nested-type node identity. NOTE: these PASS under the
+    // legacy leg too — the fix is in the SHARED structure phase, not the legacy
+    // resolution path. They are excluded here by policy to keep the #1978
+    // assertions registry-primary-only and avoid coupling the legacy parity leg
+    // to the new node-identity behavior.
+    'owns from_outer / from_other through distinct Outer.Inner / Other.Inner nodes (R7)',
+    'owns radius (attr_accessor) under the qualified Shapes.Circle node, no dangling (R7)',
   ]),
   swift: new Set<string>([
     // Swift scope-resolution achieves 77/77 baseline parity. The tests
@@ -481,6 +488,17 @@ const LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES: Readonly<Record<string, Readonly
     // sidecars and scope-resolver overload narrowing. The legacy DAG does not
     // rank function-template shapes, so it leaves the call unresolved.
     'pick(T*) wins over pick(T) for pointer arguments',
+    // #1978 qualified nested-type node identity. NOTE: unlike the entries above,
+    // these PASS under the legacy leg too — the fix is in the SHARED structure
+    // phase, not the legacy resolution path, so the legacy DAG is untouched and
+    // still produces the qualified nodes. They are excluded here by policy to
+    // keep the #1978 assertions registry-primary-only and avoid coupling the
+    // legacy parity leg to the new node-identity behavior.
+    'materializes Outer.Inner and Other.Inner as two distinct Struct nodes',
+    'owns from_outer / from_other through their OWN distinct node (positive identity, R7)',
+    'owns outer_field under Outer.Inner (struct field via the main HAS_PROPERTY path)',
+    'genuinely used the worker pool (guards against silent sequential fallback)',
+    'materializes two distinct Struct nodes and owns each method correctly (R7)',
   ]),
 };
 
