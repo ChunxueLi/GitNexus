@@ -2073,10 +2073,7 @@ describe.skip('Rust inline mod-nested same-tail collision — distinct nodes (is
   let result: PipelineResult;
 
   beforeAll(async () => {
-    result = await runPipelineFromRepo(
-      path.join(FIXTURES, 'rust-nested-tail-collision'),
-      () => {},
-    );
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'rust-nested-tail-collision'), () => {});
   }, 60000);
 
   it('owns from_outer / from_other through distinct nodes (no merge, no mis-attribution)', () => {

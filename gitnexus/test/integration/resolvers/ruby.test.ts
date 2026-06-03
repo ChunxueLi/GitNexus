@@ -1553,11 +1553,14 @@ describe('Ruby inline module-nested same-tail collision — distinct nodes (issu
   // tail name (last-wins) and the worker path can emit a duplicate cross-wired
   // edge. That is deferred to the #1978 resolution-side follow-up; the
   // structure-phase HAS_METHOD ownership above is already exact on both legs.
-  pit('owns radius (attr_accessor) under the qualified Shapes.Circle node, no dangling (R7)', () => {
-    expect(findDanglingEdges(result, ['HAS_PROPERTY'])).toEqual([]);
-    const hp = getRelationships(result, 'HAS_PROPERTY');
-    const e = hp.find((x) => x.target === 'radius');
-    expect(e, 'HAS_PROPERTY -> radius').toBeDefined();
-    expect(result.graph.getNode(e!.rel.sourceId)?.properties.qualifiedName).toBe('Shapes.Circle');
-  });
+  pit(
+    'owns radius (attr_accessor) under the qualified Shapes.Circle node, no dangling (R7)',
+    () => {
+      expect(findDanglingEdges(result, ['HAS_PROPERTY'])).toEqual([]);
+      const hp = getRelationships(result, 'HAS_PROPERTY');
+      const e = hp.find((x) => x.target === 'radius');
+      expect(e, 'HAS_PROPERTY -> radius').toBeDefined();
+      expect(result.graph.getNode(e!.rel.sourceId)?.properties.qualifiedName).toBe('Shapes.Circle');
+    },
+  );
 });
