@@ -106,6 +106,18 @@ describe('pruneLocalValueSymbols', () => {
     expect(graph.relationshipCount).toBe(2);
   });
 
+  it('prunes block-scope value symbols even when parser metadata marks them exported', () => {
+    const graph = createKnowledgeGraph();
+    graph.addNode(fileNode());
+    graph.addNode(node('Const:tmp', 'Const', { scope: 'block', isExported: true }));
+    graph.addRelationship(rel('rel:def', 'file:src/app.ts', 'Const:tmp'));
+
+    const stats = pruneLocalValueSymbols(graph);
+
+    expect(stats.prunedNodes).toBe(1);
+    expect(graph.getNode('Const:tmp')).toBeUndefined();
+  });
+
   it('keeps block-scope value symbols defined by explicit scope graph nodes', () => {
     const graph = createKnowledgeGraph();
     graph.addNode(fileNode());

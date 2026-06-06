@@ -24,8 +24,7 @@ const emptyStats = (skippedByEnv: boolean): LocalSymbolPruneStats => ({
 
 const isLocalValueCandidate = (node: GraphNode): boolean => {
   if (!LOCAL_VALUE_LABELS.has(node.label)) return false;
-  if (node.properties.scope !== 'block') return false;
-  return node.properties.isExported !== true;
+  return node.properties.scope === 'block';
 };
 
 const isFileDefinesEdgeToCandidate = (
