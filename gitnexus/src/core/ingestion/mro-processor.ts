@@ -351,6 +351,16 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
   // where a same-named method is a trait implementation (METHOD_IMPLEMENTS), not an
   // override. The EXTENDS-only walk below reinforces this structurally.
   const emittedOverrideEdgeIds = new Set<string>();
+  // Follow only EXTENDS (class-inheritance) parents and skip Interface/Trait ancestors:
+  // satisfying an interface/trait default method is a METHOD_IMPLEMENTS relationship
+  // (handled by emitMethodImplementsEdges), not an override. This also structurally
+  // excludes languages without class inheritance (e.g. Rust traits use IMPLEMENTS).
+  const extendsParentsOf = (nodeId: string): string[] =>
+    (parentMap.get(nodeId) ?? []).filter((pid) => {
+      if (parentEdgeType.get(nodeId)?.get(pid) !== 'EXTENDS') return false;
+      const pn = graph.getNode(pid);
+      return !!pn && pn.label !== 'Interface' && pn.label !== 'Trait';
+    });
   for (const classId of parentMap.keys()) {
     const classNode = graph.getNode(classId);
     const language = classNode?.properties.language as SupportedLanguages | undefined;
@@ -359,8 +369,8 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     if (getProvider(language).mroStrategy === 'qualified-syntax') continue;
 
     const ownMethods = methodMap.get(classId) ?? [];
-    const parents = parentMap.get(classId) ?? [];
-    if (parents.length === 0) continue;
+    const extendsParents = extendsParentsOf(classId);
+    if (extendsParents.length === 0) continue;
 
     for (const methodId of ownMethods) {
       const methodNode = graph.getNode(methodId);
@@ -373,7 +383,7 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
       // matched by name AND signature so a same-named overload (e.g. foo(int) vs
       // foo()) is not mistaken for an override.
       const visited = new Set<string>();
-      const queue = [...parents];
+      const queue = [...extendsParents];
       while (queue.length > 0) {
         const ancestorId = queue.shift()!;
         if (visited.has(ancestorId)) continue;
@@ -414,9 +424,8 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
           break; // nearest ancestor shadows deeper ones
         }
 
-        // Continue BFS through this ancestor's parents
-        const ancestorParents = parentMap.get(ancestorId) ?? [];
-        queue.push(...ancestorParents);
+        // Continue BFS through this ancestor's EXTENDS parents only
+        queue.push(...extendsParentsOf(ancestorId));
       }
     }
   }
