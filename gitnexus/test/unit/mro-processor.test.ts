@@ -594,7 +594,7 @@ describe('computeMRO', () => {
       addMethod(graph, 'Iface', 'run', 'Interface');
       addMethod(graph, 'Impl', 'run');
 
-      const result = computeMRO(graph);
+      computeMRO(graph);
 
       const overrides = graph.relationships.filter((r) => r.type === 'METHOD_OVERRIDES');
       expect(overrides).toHaveLength(0); // interface satisfaction is METHOD_IMPLEMENTS, not an override
