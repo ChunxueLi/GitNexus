@@ -365,17 +365,19 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
         visited.add(ancestorId);
 
         const ancestorMethods = methodMap.get(ancestorId) ?? [];
-        const matchingAncestorMethod = ancestorMethods.find((mid) => {
+        const matchingMethodId = ancestorMethods.find((mid) => {
           const mn = graph.getNode(mid);
           return mn?.properties.name === methodName;
         });
 
-        if (matchingAncestorMethod) {
-          // Found nearest ancestor with same method → emit override edge
+        if (matchingMethodId) {
+          // Found nearest ancestor with same method → emit override edge.
+          // Target the ancestor METHOD node (not the ancestor class) to honor the
+          // Class → Method contract documented at the top of this file.
           graph.addRelationship({
             id: generateId('METHOD_OVERRIDES', `${classId}->${ancestorId}`),
             sourceId: classId,
-            targetId: ancestorId,
+            targetId: matchingMethodId,
             type: 'METHOD_OVERRIDES',
             confidence: 0.9,
             reason: `single-ancestor override: ${methodName}()`,
