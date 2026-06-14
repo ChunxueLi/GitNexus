@@ -346,6 +346,7 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
   // The collision loop above skips methods where only one ancestor defines them
   // (defs.length < 2). But in Java/Kotlin, a subclass overriding a parent method
   // is the most common pattern. Detect these and emit METHOD_OVERRIDES edges.
+  const emittedOverrideEdgeIds = new Set<string>();
   for (const classId of parentMap.keys()) {
     const ownMethods = methodMap.get(classId) ?? [];
     const parents = parentMap.get(classId) ?? [];
@@ -374,15 +375,22 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
           // Found nearest ancestor with same method → emit override edge.
           // Target the ancestor METHOD node (not the ancestor class) to honor the
           // Class → Method contract documented at the top of this file.
-          graph.addRelationship({
-            id: generateId('METHOD_OVERRIDES', `${classId}->${ancestorId}`),
-            sourceId: classId,
-            targetId: matchingMethodId,
-            type: 'METHOD_OVERRIDES',
-            confidence: 0.9,
-            reason: `single-ancestor override: ${methodName}()`,
-          });
-          overrideEdges++;
+          // Key the id on the method so distinct overrides between the same
+          // class/ancestor pair stay distinct, and count only edges actually added
+          // (addRelationship is first-writer-wins, so a duplicate id is dropped).
+          const overrideId = generateId('METHOD_OVERRIDES', `${classId}->${matchingMethodId}`);
+          if (!emittedOverrideEdgeIds.has(overrideId)) {
+            emittedOverrideEdgeIds.add(overrideId);
+            graph.addRelationship({
+              id: overrideId,
+              sourceId: classId,
+              targetId: matchingMethodId,
+              type: 'METHOD_OVERRIDES',
+              confidence: 0.9,
+              reason: `single-ancestor override: ${methodName}()`,
+            });
+            overrideEdges++;
+          }
           break; // Only link to nearest ancestor
         }
 
