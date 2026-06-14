@@ -342,12 +342,11 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     });
   }
 
-
   // ── Single-ancestor override detection ──────────────────────────────────
   // The collision loop above skips methods where only one ancestor defines them
   // (defs.length < 2). But in Java/Kotlin, a subclass overriding a parent method
   // is the most common pattern. Detect these and emit METHOD_OVERRIDES edges.
-  for (const classId of classes) {
+  for (const classId of parentMap.keys()) {
     const ownMethods = methodMap.get(classId) ?? [];
     const parents = parentMap.get(classId) ?? [];
     if (parents.length === 0) continue;
