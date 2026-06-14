@@ -52,7 +52,7 @@ export const processesPhase: PipelinePhase<ProcessesOutput> = {
     ctx.graph.forEachNode((n) => {
       if (n.label !== 'File') symbolCount++;
     });
-    const dynamicMaxProcesses = Math.max(20, Math.min(300, Math.round(symbolCount / 10)));
+    const dynamicMaxProcesses = Math.max(20, Math.round(symbolCount / 10));
 
     const processResult = await processProcesses(
       ctx.graph,
