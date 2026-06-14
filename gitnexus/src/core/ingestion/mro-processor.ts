@@ -343,11 +343,21 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
   }
 
   // ── Single-ancestor override detection ──────────────────────────────────
-  // The collision loop above skips methods where only one ancestor defines them
-  // (defs.length < 2). But in Java/Kotlin, a subclass overriding a parent method
-  // is the most common pattern. Detect these and emit METHOD_OVERRIDES edges.
+  // The collision loop above only emits when a method is defined in 2+ ancestors
+  // (defs.length < 2 is skipped). A subclass overriding a single parent method via
+  // class inheritance is the common case. Applicability is derived automatically from
+  // the language's existing MRO strategy — no separate per-language flag: every
+  // strategy resolves overrides by inheritance order EXCEPT `qualified-syntax` (Rust),
+  // where a same-named method is a trait implementation (METHOD_IMPLEMENTS), not an
+  // override. The EXTENDS-only walk below reinforces this structurally.
   const emittedOverrideEdgeIds = new Set<string>();
   for (const classId of parentMap.keys()) {
+    const classNode = graph.getNode(classId);
+    const language = classNode?.properties.language as SupportedLanguages | undefined;
+    if (!language) continue;
+    // Language-aware gate, reusing the MRO model we already maintain (not a new flag).
+    if (getProvider(language).mroStrategy === 'qualified-syntax') continue;
+
     const ownMethods = methodMap.get(classId) ?? [];
     const parents = parentMap.get(classId) ?? [];
     if (parents.length === 0) continue;
