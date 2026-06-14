@@ -121,6 +121,10 @@ function buildAdjacency(graph: KnowledgeGraph) {
 type MethodDef = { classId: string; className: string; methodId: string };
 type Resolution = { resolvedTo: string | null; reason: string; confidence: number };
 
+/** Confidence for a single-ancestor override edge (a subclass overriding one parent
+ *  method via class inheritance) — same tier as MRO-ordered resolution. */
+const SINGLE_ANCESTOR_OVERRIDE_CONFIDENCE = 0.9;
+
 /** Resolve by MRO order — first ancestor in linearized order wins. */
 function resolveByMroOrder(
   methodName: string,
@@ -377,7 +381,8 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     // instead of re-walking the hierarchy (and re-reading every ancestor method node)
     // once per own method.
     type AncestorMethod = { methodId: string; paramTypes: string[]; paramCount?: number };
-    const orderedAncestorMethods: Array<Map<string, AncestorMethod[]>> = [];
+    type AncestorLevel = { className: string; methodsByName: Map<string, AncestorMethod[]> };
+    const orderedAncestorMethods: AncestorLevel[] = [];
     {
       const visited = new Set<string>();
       const queue = [...extendsParents];
@@ -386,6 +391,7 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
         if (visited.has(ancestorId)) continue;
         visited.add(ancestorId);
 
+        const ancestorName = graph.getNode(ancestorId)?.properties.name;
         const methodsByName = new Map<string, AncestorMethod[]>();
         for (const mid of methodMap.get(ancestorId) ?? []) {
           const mn = graph.getNode(mid);
@@ -399,7 +405,10 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
           if (bucket) bucket.push(entry);
           else methodsByName.set(mn.properties.name, [entry]);
         }
-        orderedAncestorMethods.push(methodsByName);
+        orderedAncestorMethods.push({
+          className: typeof ancestorName === 'string' ? ancestorName : '<anonymous>',
+          methodsByName,
+        });
         queue.push(...extendsParentsOf(ancestorId));
       }
     }
@@ -413,7 +422,7 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
 
       // Nearest ancestor (BFS order) defining this method by name AND signature, so a
       // same-named overload (e.g. foo(int) vs foo()) is not mistaken for an override.
-      for (const methodsByName of orderedAncestorMethods) {
+      for (const { className, methodsByName } of orderedAncestorMethods) {
         const sameName = methodsByName.get(methodName);
         if (!sameName) continue;
         const matches = sameName.filter(
@@ -437,8 +446,8 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
               sourceId: classId,
               targetId: matchingMethodId,
               type: 'METHOD_OVERRIDES',
-              confidence: 0.9,
-              reason: `single-ancestor override: ${methodName}()`,
+              confidence: SINGLE_ANCESTOR_OVERRIDE_CONFIDENCE,
+              reason: `single-ancestor override: ${className}::${methodName}()`,
             });
             overrideEdges++;
           }
