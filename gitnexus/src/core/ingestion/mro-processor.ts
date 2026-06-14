@@ -342,6 +342,56 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
     });
   }
 
+
+  // ── Single-ancestor override detection ──────────────────────────────────
+  // The collision loop above skips methods where only one ancestor defines them
+  // (defs.length < 2). But in Java/Kotlin, a subclass overriding a parent method
+  // is the most common pattern. Detect these and emit METHOD_OVERRIDES edges.
+  for (const classId of classes) {
+    const ownMethods = methodMap.get(classId) ?? [];
+    const parents = parentMap.get(classId) ?? [];
+    if (parents.length === 0) continue;
+
+    for (const methodId of ownMethods) {
+      const methodNode = graph.getNode(methodId);
+      if (!methodNode?.properties.name) continue;
+      const methodName = methodNode.properties.name;
+
+      // Walk ancestors to find the nearest one that also defines this method
+      const visited = new Set<string>();
+      const queue = [...parents];
+      while (queue.length > 0) {
+        const ancestorId = queue.shift()!;
+        if (visited.has(ancestorId)) continue;
+        visited.add(ancestorId);
+
+        const ancestorMethods = methodMap.get(ancestorId) ?? [];
+        const matchingAncestorMethod = ancestorMethods.find((mid) => {
+          const mn = graph.getNode(mid);
+          return mn?.properties.name === methodName;
+        });
+
+        if (matchingAncestorMethod) {
+          // Found nearest ancestor with same method → emit override edge
+          graph.addRelationship({
+            id: generateId('METHOD_OVERRIDES', `${classId}->${ancestorId}`),
+            sourceId: classId,
+            targetId: ancestorId,
+            type: 'METHOD_OVERRIDES',
+            confidence: 0.9,
+            reason: `single-ancestor override: ${methodName}()`,
+          });
+          overrideEdges++;
+          break; // Only link to nearest ancestor
+        }
+
+        // Continue BFS through this ancestor's parents
+        const ancestorParents = parentMap.get(ancestorId) ?? [];
+        queue.push(...ancestorParents);
+      }
+    }
+  }
+
   const methodImplementsEdges = emitMethodImplementsEdges(
     graph,
     parentMap,
