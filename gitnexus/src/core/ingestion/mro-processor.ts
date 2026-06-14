@@ -364,10 +364,14 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
 
     for (const methodId of ownMethods) {
       const methodNode = graph.getNode(methodId);
-      if (!methodNode?.properties.name) continue;
+      if (!methodNode || methodNode.label === 'Property' || !methodNode.properties.name) continue;
       const methodName = methodNode.properties.name;
+      const ownParamTypes = (methodNode.properties.parameterTypes as string[] | undefined) ?? [];
+      const ownParamCount = methodNode.properties.parameterCount as number | undefined;
 
-      // Walk ancestors to find the nearest one that also defines this method
+      // Walk ancestors to find the nearest one that also defines this method,
+      // matched by name AND signature so a same-named overload (e.g. foo(int) vs
+      // foo()) is not mistaken for an override.
       const visited = new Set<string>();
       const queue = [...parents];
       while (queue.length > 0) {
@@ -375,33 +379,39 @@ export function computeMRO(graph: KnowledgeGraph): MROResult {
         if (visited.has(ancestorId)) continue;
         visited.add(ancestorId);
 
-        const ancestorMethods = methodMap.get(ancestorId) ?? [];
-        const matchingMethodId = ancestorMethods.find((mid) => {
+        const ancestorMatches = (methodMap.get(ancestorId) ?? []).filter((mid) => {
           const mn = graph.getNode(mid);
-          return mn?.properties.name === methodName;
+          if (!mn || mn.label === 'Property' || mn.properties.name !== methodName) return false;
+          const aTypes = (mn.properties.parameterTypes as string[] | undefined) ?? [];
+          const aCount = mn.properties.parameterCount as number | undefined;
+          return parameterTypesMatch(ownParamTypes, aTypes, ownParamCount, aCount).match;
         });
 
-        if (matchingMethodId) {
-          // Found nearest ancestor with same method → emit override edge.
-          // Target the ancestor METHOD node (not the ancestor class) to honor the
-          // Class → Method contract documented at the top of this file.
-          // Key the id on the method so distinct overrides between the same
-          // class/ancestor pair stay distinct, and count only edges actually added
-          // (addRelationship is first-writer-wins, so a duplicate id is dropped).
-          const overrideId = generateId('METHOD_OVERRIDES', `${classId}->${matchingMethodId}`);
-          if (!emittedOverrideEdgeIds.has(overrideId)) {
-            emittedOverrideEdgeIds.add(overrideId);
-            graph.addRelationship({
-              id: overrideId,
-              sourceId: classId,
-              targetId: matchingMethodId,
-              type: 'METHOD_OVERRIDES',
-              confidence: 0.9,
-              reason: `single-ancestor override: ${methodName}()`,
-            });
-            overrideEdges++;
+        if (ancestorMatches.length > 0) {
+          // Nearest ancestor defines this method by name+signature. Emit only when the
+          // match is unambiguous (exactly one candidate); >1 means the override target
+          // cannot be pinned, so emit nothing. Either way stop — a closer ancestor
+          // shadows anything deeper.
+          if (ancestorMatches.length === 1) {
+            const matchingMethodId = ancestorMatches[0];
+            // Target the ancestor METHOD node (not the class), key the id on the method
+            // so distinct overrides stay distinct, and count only edges actually added
+            // (addRelationship is first-writer-wins, so a duplicate id is dropped).
+            const overrideId = generateId('METHOD_OVERRIDES', `${classId}->${matchingMethodId}`);
+            if (!emittedOverrideEdgeIds.has(overrideId)) {
+              emittedOverrideEdgeIds.add(overrideId);
+              graph.addRelationship({
+                id: overrideId,
+                sourceId: classId,
+                targetId: matchingMethodId,
+                type: 'METHOD_OVERRIDES',
+                confidence: 0.9,
+                reason: `single-ancestor override: ${methodName}()`,
+              });
+              overrideEdges++;
+            }
           }
-          break; // Only link to nearest ancestor
+          break; // nearest ancestor shadows deeper ones
         }
 
         // Continue BFS through this ancestor's parents
