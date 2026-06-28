@@ -522,4 +522,78 @@ describe('processProcesses', () => {
     expect(result.processes.length).toBeLessThanOrEqual(3);
     expect(result.stats.totalProcesses).toBeLessThanOrEqual(3);
   });
+
+  // Regression for #2198: the processesPhase dynamic sizing used to cap at
+  // Math.min(300, symbolCount/10). On large repos (>3000 symbols) that silently
+  // truncated the process index. The cap was removed so dynamicMaxProcesses
+  // grows with symbolCount. This test verifies that processProcesses honours a
+  // large maxProcesses (>300) without truncation, mirroring the phase-level fix.
+  it('honours maxProcesses > 300 (no hardcoded cap, #2198)', async () => {
+    const graph = createKnowledgeGraph();
+
+    // 200 branching chains, each producing 2 unique traces.
+    // entry → midA → leafA
+    // entry → midB → leafB
+    // That's 200 entry points × 2 traces = 400 candidate traces.
+    for (let chain = 0; chain < 200; chain++) {
+      const entry = `func:e${chain}`;
+      const midA = `func:e${chain}_a`;
+      const midB = `func:e${chain}_b`;
+      const leafA = `func:e${chain}_la`;
+      const leafB = `func:e${chain}_lb`;
+
+      for (const [id, name, exported] of [
+        [entry, `e${chain}`, true],
+        [midA, `e${chain}_a`, false],
+        [midB, `e${chain}_b`, false],
+        [leafA, `e${chain}_la`, false],
+        [leafB, `e${chain}_lb`, false],
+      ] as const) {
+        graph.addNode({
+          id,
+          label: 'Function',
+          properties: {
+            name,
+            filePath: `src/c${chain}.ts`,
+            startLine: 1,
+            endLine: 5,
+            isExported: exported,
+          },
+        });
+      }
+
+      // entry → midA → leafA  AND  entry → midB → leafB
+      for (const [src, tgt] of [
+        [entry, midA],
+        [midA, leafA],
+        [entry, midB],
+        [midB, leafB],
+      ] as const) {
+        graph.addRelationship({
+          id: `call:${src}_${tgt}`,
+          sourceId: src,
+          targetId: tgt,
+          type: 'CALLS',
+          confidence: 0.9,
+          reason: '',
+        });
+      }
+    }
+
+    const memberships: CommunityMembership[] = [];
+    for (let chain = 0; chain < 200; chain++) {
+      for (const suffix of ['', '_a', '_b', '_la', '_lb']) {
+        memberships.push({ nodeId: `func:e${chain}${suffix}`, communityId: `community:${chain}` });
+      }
+    }
+
+    // maxProcesses: 400 — would be silently capped to 300 before the fix
+    const config: Partial<ProcessDetectionConfig> = { maxProcesses: 400 };
+    const result = await processProcesses(graph, memberships, undefined, config);
+
+    // 200 entry points × 2 branches = up to 400 unique traces.
+    // The old 300-cap would have truncated to 300; we expect > 300.
+    expect(result.stats.totalProcesses).toBeGreaterThan(300);
+    expect(result.processes.length).toBeLessThanOrEqual(400);
+  });
 });
