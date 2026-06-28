@@ -76,12 +76,13 @@ const FULL_ORDER = [
   'scopeResolution',
   'pruneLocalSymbols',
   'mro',
+  'spring-di',
   'communities',
   'processes',
 ];
 
 const WITHOUT_GRAPH_PHASES = FULL_ORDER.filter(
-  (n) => n !== 'mro' && n !== 'communities' && n !== 'processes',
+  (n) => n !== 'mro' && n !== 'spring-di' && n !== 'communities' && n !== 'processes',
 );
 
 describe('buildPhaseList parity (registry refactor, #2080)', () => {
@@ -94,7 +95,7 @@ describe('buildPhaseList parity (registry refactor, #2080)', () => {
     expect(buildPhaseList({ skipGraphPhases: false }).map((p) => p.name)).toEqual(FULL_ORDER);
   });
 
-  it('skipGraphPhases:true → omits exactly mro/communities/processes', () => {
+  it('skipGraphPhases:true → omits exactly mro/spring-di/communities/processes', () => {
     expect(buildPhaseList({ skipGraphPhases: true }).map((p) => p.name)).toEqual(
       WITHOUT_GRAPH_PHASES,
     );
