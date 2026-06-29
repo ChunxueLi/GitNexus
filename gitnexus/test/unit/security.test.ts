@@ -16,28 +16,34 @@ import {
 // ─── Relation type allowlist ──────────────────────────────────────────
 
 describe('VALID_RELATION_TYPES', () => {
+  // The expected types are declared once here; the size assertion derives from
+  // the array length so adding a new type only requires appending to this list.
+  const EXPECTED_RELATION_TYPES = [
+    'CALLS',
+    'IMPORTS',
+    'EXTENDS',
+    'IMPLEMENTS',
+    'HAS_METHOD',
+    'HAS_PROPERTY',
+    'METHOD_OVERRIDES',
+    'OVERRIDES',
+    'METHOD_IMPLEMENTS',
+    'ACCESSES',
+    // USES is an emitted edge type (emit-references.ts) used in the default
+    // impact relTypes + context queries; added to the allowlist in F5.
+    'USES',
+    'HANDLES_ROUTE',
+    'FETCHES',
+    'HANDLES_TOOL',
+    'ENTRY_POINT_OF',
+    'WRAPS',
+    // Spring DI @Autowired collection injection (#2200)
+    'INJECTS',
+  ] as const;
+
   it('contains all expected relation types', () => {
-    expect(VALID_RELATION_TYPES.size).toBe(16);
-    for (const t of [
-      'CALLS',
-      'IMPORTS',
-      'EXTENDS',
-      'IMPLEMENTS',
-      'HAS_METHOD',
-      'HAS_PROPERTY',
-      'METHOD_OVERRIDES',
-      'OVERRIDES',
-      'METHOD_IMPLEMENTS',
-      'ACCESSES',
-      // USES is an emitted edge type (emit-references.ts) used in the default
-      // impact relTypes + context queries; added to the allowlist in F5.
-      'USES',
-      'HANDLES_ROUTE',
-      'FETCHES',
-      'HANDLES_TOOL',
-      'ENTRY_POINT_OF',
-      'WRAPS',
-    ]) {
+    expect(VALID_RELATION_TYPES.size).toBe(EXPECTED_RELATION_TYPES.length);
+    for (const t of EXPECTED_RELATION_TYPES) {
       expect(VALID_RELATION_TYPES.has(t)).toBe(true);
     }
   });
@@ -63,7 +69,8 @@ describe('VALID_RELATION_TYPES', () => {
     // findings), never impact()'s BFS. Pinned so a future allow-all sweep
     // can't drag it in, and the set size stays fixed at 16.
     expect(VALID_RELATION_TYPES.has('TAINT_PATH')).toBe(false);
-    expect(VALID_RELATION_TYPES.size).toBe(16);
+    // Size should match the expected types list — not a hardcoded number.
+    expect(VALID_RELATION_TYPES.size).toBe(EXPECTED_RELATION_TYPES.length);
   });
 
   it('CDG control-dependence edge types stay OUT of the impact allow-list (#2085 M5)', () => {
