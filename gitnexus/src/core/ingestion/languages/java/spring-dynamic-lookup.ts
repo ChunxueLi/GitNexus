@@ -53,14 +53,21 @@ const KNOWN_RECEIVERS = new Set([
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-interface LookupSite {
+export interface LookupSite {
   callerNodeId: string;
   typeName: string;
   isCollection: boolean;
 }
 
-/** Detect `Receiver.method(Type.class)` patterns in source text. */
-function extractDynamicLookups(sourceText: string, callerNodeId: string): LookupSite[] {
+/**
+ * Detect `Receiver.method(Type.class)` patterns in source text.
+ *
+ * Exported for direct unit testing — the test suite imports THIS function
+ * (and the KNOWN_RECEIVERS / method sets below) rather than re-implementing
+ * the pattern, so a change to the production regex fails the suite instead
+ * of silently passing against a stale copy.
+ */
+export function extractDynamicLookups(sourceText: string, callerNodeId: string): LookupSite[] {
   const sites: LookupSite[] = [];
   // Match: receiver.getBean[s](Type.class)
   const pattern = /(\w+)\.(getBeans(?:OfType)?|getBean)\s*\(\s*(\w+)\.class\s*\)/g;
