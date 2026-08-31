@@ -373,11 +373,15 @@ public class Second {
       // And each HAS_METHOD edge anchors on its own class — the owner
       // resolution is what the AST-node-id key fixed.
       const edges = result.relationships.map((r) => `${r.sourceId} -> ${r.targetId}`).sort();
+      // Same-named nested classes in one file get a `~N` occurrence suffix on
+      // the synthesized id prefix (review P1: name-only prefixes collapsed
+      // both getters onto one Method node). A lone nested class keeps the
+      // plain shape, byte-identical to real member ids.
       expect(edges).toEqual([
-        'Class:/test/Order.java:First.Item -> Method:/test/Order.java:Item.getA#0',
-        'Class:/test/Order.java:First.Item -> Method:/test/Order.java:Item.setA#1',
-        'Class:/test/Order.java:Second.Item -> Method:/test/Order.java:Item.getB#0',
-        'Class:/test/Order.java:Second.Item -> Method:/test/Order.java:Item.setB#1',
+        'Class:/test/Order.java:First.Item -> Method:/test/Order.java:Item~0.getA#0',
+        'Class:/test/Order.java:First.Item -> Method:/test/Order.java:Item~0.setA#1',
+        'Class:/test/Order.java:Second.Item -> Method:/test/Order.java:Item~1.getB#0',
+        'Class:/test/Order.java:Second.Item -> Method:/test/Order.java:Item~1.setB#1',
       ]);
     });
   });
@@ -420,5 +424,148 @@ public class Order {
         expect(node.properties.isStatic).toBe(false);
       }
     });
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Review regression coverage (magyargergo, 2026-08-29) — each finding gets
+// a pinned test so the exact reported trigger stays guarded.
+// ═══════════════════════════════════════════════════════════════════════════
+
+describe('review regressions', () => {
+  it('P1: primitive boolean isX fields keep isEnabled/setEnabled (Lombok ^is[A-Z] base rule)', () => {
+    const tree = parse(`
+@Data
+public class Flag {
+    private boolean isEnabled;
+    private boolean active;
+    private boolean island;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    const names = result.symbols.map((s) => s.name).sort();
+    // `isEnabled` absorbs its `is` prefix (base name `enabled`), so the getter
+    // is `isEnabled()` — NOT `isIsEnabled()`, and the setter is `setEnabled`.
+    // Plain `active` gets `isActive`. `island` does NOT match ^is[A-Z]
+    // (third char is lowercase), so as a boolean it gets `isIsland()` —
+    // which is exactly what Lombok emits for it.
+    expect(names).toEqual([
+      'isIsland', 'setIsland',
+      'isActive', 'setEnabled', 'isEnabled', 'setActive',
+    ].sort());
+  });
+
+  it('P1: boxed Boolean uses get (not is), per Lombok', () => {
+    const tree = parse(`
+@Data
+public class Flag {
+    private Boolean enabled;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    expect(result.symbols.map((s) => s.name).sort()).toEqual(['getEnabled', 'setEnabled']);
+  });
+
+  it('P1: field-only @Getter (no class-level annotation) still synthesizes', () => {
+    const tree = parse(`
+public class Item {
+    @Getter
+    private String value;
+    private String other;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    // Only `value` is opted in by the field annotation; `other` stays bare.
+    expect(result.symbols.map((s) => s.name)).toEqual(['getValue']);
+  });
+
+  it('P1: class-level @Getter(AccessLevel.NONE) disables getters class-wide', () => {
+    const tree = parse(`
+@Getter(AccessLevel.NONE)
+public class A {
+    private String x;
+    @Getter
+    private String y;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    // Class default off entirely; only the field-level opt-in survives.
+    expect(result.symbols.map((s) => s.name)).toEqual(['getY']);
+  });
+
+  it('P1: non-Lombok qualified annotations are ignored (@com.acme.Data is not Lombok)', () => {
+    const tree = parse(`
+@com.acme.Data
+public class NotLombok {
+    private String x;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    expect(result.symbols).toHaveLength(0);
+  });
+
+  it('P1: lombok-qualified annotations ARE Lombok (@lombok.Data)', () => {
+    const tree = parse(`
+@lombok.Data
+public class Real {
+    private String x;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    expect(result.symbols.map((s) => s.name).sort()).toEqual(['getX', 'setX']);
+  });
+
+  it('P2: non-default access levels are emitted as real visibility', () => {
+    const tree = parse(`
+public class Levels {
+    @Getter(AccessLevel.PROTECTED)
+    private String prot;
+    @Getter(AccessLevel.PRIVATE)
+    private String priv;
+    @Setter(AccessLevel.PACKAGE)
+    private String pkg;
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    const byName = new Map(result.symbols.map((s) => [s.name, s]));
+    expect(byName.get('getProt')!.visibility).toBe('protected');
+    expect(byName.get('getPriv')!.visibility).toBe('private');
+    expect(byName.get('setPkg')!.visibility).toBe('package');
+  });
+
+  it('P2: hand-written getX(int) overload does NOT suppress zero-arg Lombok getter', () => {
+    const tree = parse(`
+@Data
+public class Overload {
+    private String x;
+    public String getX(int mode) { return null; }
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    // Arity-aware collision: getX(int) is arity 1, the Lombok getter is
+    // arity 0 — both coexist in Java, so the getter must be synthesized.
+    expect(result.symbols.map((s) => s.name)).toContain('getX');
+  });
+
+  it('P2: hand-written zero-arg getX DOES suppress the Lombok getter', () => {
+    const tree = parse(`
+@Data
+public class Real {
+    private String x;
+    public String getX() { return "hand"; }
+}
+`);
+    const owners = ownerMapBySimpleName(tree, FILE_PATH);
+    const result = synthesizeLombokAccessors(tree, FILE_PATH, owners);
+    expect(result.symbols.map((s) => s.name)).not.toContain('getX');
+    expect(result.symbols.map((s) => s.name)).toContain('setX');
   });
 });

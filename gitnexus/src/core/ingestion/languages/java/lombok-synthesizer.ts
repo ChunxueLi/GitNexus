@@ -56,6 +56,14 @@ interface LombokField {
   suppressGetter: boolean;
   /** True when @Setter(AccessLevel.NONE) suppresses the setter for this field. */
   suppressSetter: boolean;
+  /** Field-level access level override for the getter (default 'public'). */
+  getterAccess: string;
+  /** Field-level access level override for the setter (default 'public'). */
+  setterAccess: string;
+  /** Field-level Lombok @Getter opt-in (class default off, review P1). */
+  enableGetter: boolean;
+  /** Field-level Lombok @Setter opt-in (class default off, review P1). */
+  enableSetter: boolean;
 }
 
 /** A class eligible for Lombok accessor synthesis. */
@@ -68,8 +76,22 @@ interface LombokClass {
   generateGetters: boolean;
   generateSetters: boolean;
   fields: LombokField[];
-  /** Names of methods already declared in this class body (collision guard). */
-  existingMethods: Set<string>;
+  /**
+   * Hand-written methods in this class body, keyed by name with their
+   * arities (review P2): a field `x` plus a hand-written `getX(int mode)`
+   * (arity 1) must NOT suppress the zero-arg Lombok getter — Java resolves
+   * overloads by arity, and both can coexist.
+   */
+  existingMethods: Map<string, Set<number>>;
+  /** Effective access level from class-level @Getter/@Setter (P2: non-default levels). */
+  getterAccess: string;
+  setterAccess: string;
+  /**
+   * Id prefix for synthesized methods: the simple name, plus a `~N`
+   * occurrence suffix ONLY when a same-named sibling class exists in this
+   * file (nested-class same-tail collision, review P1).
+   */
+  idPrefix: string;
 }
 
 /** Synthetic symbol entry — mirrors the shape pushed to `result.symbols`. */
@@ -133,65 +155,120 @@ function capitalize(s: string): string {
   return s.length > 0 ? s.charAt(0).toUpperCase() + s.slice(1) : s;
 }
 
+/** Map a Lombok AccessLevel to the graph `visibility` value. */
+function accessLevelToVisibility(level: string): string {
+  switch (level) {
+    case 'PUBLIC':
+      return 'public';
+    case 'PROTECTED':
+      return 'protected';
+    case 'PRIVATE':
+    case 'NONE':
+      return 'private';
+    case 'PACKAGE':
+    case 'MODULE':
+      return 'package';
+    default:
+      return 'public';
+  }
+}
+
+/**
+ * Lombok's base-name rule: for a field named `isEnabled`, the accessor base
+ * name is `enabled` (the `is` prefix is absorbed), so Lombok emits
+ * `isEnabled()` / `setEnabled(...)` — NOT `isIsEnabled()`. Only a lowercase
+ * `is` followed by an uppercase letter counts (Lombok's `^is[A-Z]` check),
+ * so a field actually named `island` keeps its full name (`getIsland()`).
+ */
+function lombokBaseName(fieldName: string): string {
+  if (fieldName.length > 2 && fieldName.startsWith('is') &&
+      fieldName.charAt(2) === fieldName.charAt(2).toUpperCase()) {
+    return fieldName.slice(2);
+  }
+  return fieldName;
+}
+
 /** Generate the Lombok getter method name for a field. */
 function getterName(fieldName: string, fieldType: string): string {
-  // Primitive boolean → isXxx(); everything else → getXxx()
+  // Primitive boolean → isXxx(); everything else (incl. boxed Boolean) → getXxx()
+  const base = capitalize(lombokBaseName(fieldName));
   if (fieldType === 'boolean') {
-    return `is${capitalize(fieldName)}`;
+    return `is${base}`;
   }
-  return `get${capitalize(fieldName)}`;
+  return `get${base}`;
 }
 
 /** Generate the Lombok setter method name for a field. */
 function setterName(fieldName: string): string {
-  return `set${capitalize(fieldName)}`;
+  return `set${capitalize(lombokBaseName(fieldName))}`;
+}
+
+interface AnnotationInfo {
+  /** Simple name, e.g. `Data`. */
+  simpleName: string;
+  /** True when written as a bare (unqualified) `@Data`. */
+  bare: boolean;
+  /** True when written qualified with the real Lombok package `@lombok.Data`. */
+  lombokQualified: boolean;
+  /** Full argument text for AccessLevel parsing (empty when none). */
+  argsText: string;
 }
 
 /**
- * Extract annotation simple names from a tree-sitter `modifiers` node.
- * Handles both `marker_annotation` (`@Data`) and `annotation` (`@Getter(...)`)
- * and their fully-qualified forms (`@lombok.Data`).
+ * Extract Lombok-relevant annotation info from a tree-sitter `modifiers` node.
+ *
+ * Qualification discipline (review P1): a third-party or project-local
+ * `@Data`/`@Getter`/`@Setter` must NOT be treated as Lombok. We accept a
+ * name only when it is (a) bare — `@Data`, by far the common form — or
+ * (b) qualified with the actual Lombok package — `@lombok.Data`. A name
+ * qualified with any other prefix (`@com.acme.Data`) is ignored.
  */
-function extractAnnotationNames(modifiersNode: Parser.SyntaxNode | null): Set<string> {
-  const names = new Set<string>();
-  if (!modifiersNode) return names;
+function extractAnnotationInfo(modifiersNode: Parser.SyntaxNode | null): Map<string, AnnotationInfo> {
+  const infos = new Map<string, AnnotationInfo>();
+  if (!modifiersNode) return infos;
 
   for (const child of modifiersNode.children) {
     if (child.type !== 'marker_annotation' && child.type !== 'annotation') continue;
-    // The name child is a named field 'name' within marker_annotation/annotation
     const nameNode = child.childForFieldName('name');
     const text = nameNode?.text ?? '';
-    // Normalize to simple name: `lombok.Data` → `Data`
-    const simpleName = text.split('.').pop() ?? text;
-    if (simpleName) names.add(simpleName);
+    if (!text) continue;
+    const dot = text.lastIndexOf('.');
+    let bare = false;
+    let lombokQualified = false;
+    let simpleName = text;
+    if (dot === -1) {
+      bare = true;
+    } else {
+      simpleName = text.slice(dot + 1);
+      lombokQualified = text.slice(0, dot) === 'lombok';
+    }
+    if (!simpleName) continue;
+    // Argument text for AccessLevel parsing: `@Getter(AccessLevel.PROTECTED)`
+    // → the `element_value_expression` content after `(`.
+    let argsText = '';
+    if (child.type === 'annotation') {
+      const open = child.text.indexOf('(');
+      const close = child.text.lastIndexOf(')');
+      if (open !== -1 && close > open) argsText = child.text.slice(open + 1, close);
+    }
+    infos.set(simpleName, { simpleName, bare, lombokQualified, argsText });
   }
-  return names;
+  return infos;
 }
 
-/**
- * Determine if a field's Lombok accessor is suppressed.
- *
- * `@Getter(AccessLevel.NONE)` or `@Setter(AccessLevel.NONE)` on a field
- * disables that specific accessor. We check for the string `NONE` in the
- * annotation text as a lightweight heuristic — the annotation argument is
- * always an enum constant, so `NONE` uniquely identifies suppression.
- */
-function isAccessorSuppressed(
-  fieldNode: Parser.SyntaxNode,
-  accessorType: 'Getter' | 'Setter',
-): boolean {
-  const modifiers = fieldNode.children.find((c) => c.type === 'modifiers');
-  if (!modifiers) return false;
-  for (const child of modifiers.children) {
-    if (child.type !== 'annotation') continue;
-    const nameNode = child.childForFieldName('name');
-    const simpleName = nameNode?.text.split('.').pop();
-    if (simpleName === accessorType && child.text.includes('NONE')) {
-      return true;
-    }
-  }
-  return false;
+/** A Lombok annotation is one written bare or `lombok.`-qualified. */
+function isLombokAnnotation(info: AnnotationInfo | undefined): boolean {
+  if (!info) return false;
+  return info.bare || info.lombokQualified;
 }
+
+/** AccessLevel value carried by an annotation's arguments, if any. */
+function accessLevelOf(info: AnnotationInfo | undefined): string | undefined {
+  if (!info || !info.argsText) return undefined;
+  const m = /AccessLevel\s*\.\s*(NONE|PUBLIC|PROTECTED|PACKAGE|PRIVATE|MODULE)/.exec(info.argsText);
+  return m ? m[1] : undefined;
+}
+
 
 /**
  * Parse a field declaration node to extract field name(s) and type.
@@ -202,8 +279,8 @@ function isAccessorSuppressed(
  */
 function parseFieldDeclaration(
   fieldNode: Parser.SyntaxNode,
-): { name: string; type: string; isStatic: boolean; isFinal: boolean; suppressGetter: boolean; suppressSetter: boolean }[] {
-  const results: { name: string; type: string; isStatic: boolean; isFinal: boolean; suppressGetter: boolean; suppressSetter: boolean }[] = [];
+): LombokField[] {
+  const results: { name: string; type: string; isStatic: boolean; isFinal: boolean; suppressGetter: boolean; suppressSetter: boolean; getterAccess: string; setterAccess: string; enableGetter: boolean; enableSetter: boolean }[] = [];
 
   // Type is in the `type` field
   const typeNode = fieldNode.childForFieldName('type');
@@ -249,6 +326,10 @@ function parseFieldDeclaration(
         isFinal,
         suppressGetter: false,
         suppressSetter: false,
+        getterAccess: 'public',
+        setterAccess: 'public',
+        enableGetter: false,
+        enableSetter: false,
       });
     }
   }
@@ -257,60 +338,137 @@ function parseFieldDeclaration(
 }
 
 /**
- * Collect method names from a class body (for collision detection).
- * Walks direct children of the class body for `method_declaration` nodes.
+ * Collect hand-written methods from a class body for collision detection.
+ * Keyed by name → set of arities (review P2): a zero-arg Lombok getter is
+ * only suppressed by a hand-written method with the SAME name and the SAME
+ * (zero) arity — `getX(int mode)` is a distinct overload and Java keeps both.
  */
-function collectExistingMethodNames(classBody: Parser.SyntaxNode | null): Set<string> {
-  const names = new Set<string>();
-  if (!classBody) return names;
+function collectExistingMethodArityMap(
+  classBody: Parser.SyntaxNode | null,
+): Map<string, Set<number>> {
+  const map = new Map<string, Set<number>>();
+  if (!classBody) return map;
   for (const child of classBody.children) {
-    if (child.type === 'method_declaration') {
-      const nameNode = child.childForFieldName('name');
-      if (nameNode) names.add(nameNode.text);
+    if (child.type !== 'method_declaration') continue;
+    const nameNode = child.childForFieldName('name');
+    if (!nameNode) continue;
+    const params = child.childForFieldName('parameters');
+    const arity = params
+      ? params.children.filter((c) => c.type === 'formal_parameter' || c.type === 'spread_parameter').length
+      : 0;
+    let arities = map.get(nameNode.text);
+    if (!arities) {
+      arities = new Set<number>();
+      map.set(nameNode.text, arities);
     }
+    arities.add(arity);
   }
-  return names;
+  return map;
 }
 
-/** Walk the tree for class_declaration nodes eligible for Lombok synthesis. */
+/** True when a hand-written method with this name and arity exists. */
+function hasMethodWithArity(
+  map: Map<string, Set<number>>,
+  name: string,
+  arity: number,
+): boolean {
+  return map.get(name)?.has(arity) === true;
+}
+
+/**
+ * Walk the tree for class_declaration nodes eligible for Lombok synthesis.
+ *
+ * Eligibility (review P1): a class participates when EITHER
+ *  (a) a class-level Lombok `@Data`/`@Getter`/`@Setter` enables accessors by
+ *      default, OR
+ *  (b) at least one FIELD carries its own Lombok `@Getter`/`@Setter`
+ *      (field-level annotations act as opt-in for that field alone).
+ * Class-level `AccessLevel.NONE` disables that accessor class-wide (distinct
+ * from field-level NONE, which suppresses per field).
+ */
 function findLombokClasses(root: Parser.SyntaxNode): LombokClass[] {
   const classes: LombokClass[] = [];
+
+  // Pre-pass: count every class_declaration simple name in the file so a
+  // same-named nested pair (First.Item / Second.Item) can be distinguished
+  // regardless of Lombok eligibility (the non-Lombok twin still consumes
+  // the plain id shape in the real capture path).
+  const classNameCounts = new Map<string, number>();
+  function countNames(node: Parser.SyntaxNode): void {
+    if (node.type === 'class_declaration') {
+      const n = node.childForFieldName('name')?.text;
+      if (n) classNameCounts.set(n, (classNameCounts.get(n) ?? 0) + 1);
+    }
+    for (const child of node.children) countNames(child);
+  }
+  countNames(root);
+  const seenSoFar = new Map<string, number>();
 
   function walk(node: Parser.SyntaxNode): void {
     if (node.type === 'class_declaration') {
       const modifiers = node.children.find((c) => c.type === 'modifiers');
-      const annotations = extractAnnotationNames(modifiers);
+      const annos = extractAnnotationInfo(modifiers);
 
-      const hasGetter = annotations.has('Getter') || annotations.has('Data');
-      const hasSetter = annotations.has('Setter') || annotations.has('Data');
+      const isLombokData = isLombokAnnotation(annos.get('Data'));
+      const classGetter = annos.get('Getter');
+      const classSetter = annos.get('Setter');
+      // Class-level NONE disables that accessor class-wide (review P1).
+      const classGetterNone = isLombokAnnotation(classGetter) && accessLevelOf(classGetter) === 'NONE';
+      const classSetterNone = isLombokAnnotation(classSetter) && accessLevelOf(classSetter) === 'NONE';
+      const hasGetter = (isLombokData || (isLombokAnnotation(classGetter) && !classGetterNone));
+      const hasSetter = (isLombokData || (isLombokAnnotation(classSetter) && !classSetterNone));
+      const getterAccess = accessLevelOf(classGetter) ?? 'public';
+      const setterAccess = accessLevelOf(classSetter) ?? 'public';
 
-      if (hasGetter || hasSetter) {
+      const body = node.children.find((c) => c.type === 'class_body');
+
+      // Field-level Lombok annotations make the class eligible even without
+      // a class-level annotation (review P1).
+      let fieldLevelEligible = false;
+      const fields: LombokField[] = [];
+      if (body) {
+        for (const child of body.children) {
+          if (child.type !== 'field_declaration') continue;
+          const fieldMods = child.children.find((c) => c.type === 'modifiers');
+          const fieldAnnos = extractAnnotationInfo(fieldMods);
+          const fieldGetter = fieldAnnos.get('Getter');
+          const fieldSetter = fieldAnnos.get('Setter');
+          const fieldHasGetter = isLombokAnnotation(fieldGetter);
+          const fieldHasSetter = isLombokAnnotation(fieldSetter);
+          if (fieldHasGetter || fieldHasSetter) fieldLevelEligible = true;
+
+          for (let f of parseFieldDeclaration(child)) {
+            // Skip static fields (Lombok doesn't generate instance accessors for static fields)
+            if (f.isStatic) continue;
+            // Field-level NONE suppresses that accessor for this field only.
+            const fieldGetterNone = fieldHasGetter && accessLevelOf(fieldGetter) === 'NONE';
+            const fieldSetterNone = fieldHasSetter && accessLevelOf(fieldSetter) === 'NONE';
+            // Class-wide default gates whether field annotations act as
+            // opt-in or as overrides on top of the class default.
+            if (fieldHasGetter && !fieldGetterNone) f.enableGetter = true;
+            if (fieldHasSetter && !fieldSetterNone) f.enableSetter = true;
+            if (fieldGetterNone) f.suppressGetter = true;
+            if (fieldSetterNone) f.suppressSetter = true;
+            // Effective access: field-level annotation wins over class default.
+            f.getterAccess = fieldHasGetter ? (accessLevelOf(fieldGetter) ?? 'public') : getterAccess;
+            f.setterAccess = fieldHasSetter ? (accessLevelOf(fieldSetter) ?? 'public') : setterAccess;
+            fields.push(f);
+          }
+        }
+      }
+
+      if (hasGetter || hasSetter || fieldLevelEligible) {
         const nameNode = node.childForFieldName('name');
         const className = nameNode?.text ?? '';
         if (className) {
-          // Find class body
-          const body = node.children.find((c) => c.type === 'class_body');
-          const existingMethods = collectExistingMethodNames(body ?? null);
-
-          // Collect fields
-          const fields: LombokField[] = [];
-          if (body) {
-            for (const child of body.children) {
-              if (child.type !== 'field_declaration') continue;
-              for (const f of parseFieldDeclaration(child)) {
-                // Skip static fields (Lombok doesn't generate instance accessors for static fields)
-                if (f.isStatic) continue;
-                // Mark accessors suppressed when @Getter/@Setter(AccessLevel.NONE) is on the field
-                if (hasGetter && isAccessorSuppressed(child, 'Getter')) {
-                  f.suppressGetter = true;
-                }
-                if (hasSetter && isAccessorSuppressed(child, 'Setter')) {
-                  f.suppressSetter = true;
-                }
-                fields.push(f);
-              }
-            }
-          }
+          const occurrence = seenSoFar.get(className) ?? 0;
+          seenSoFar.set(className, occurrence + 1);
+          // Plain shape when unique in file; `~N` disambiguator only when a
+          // same-named sibling exists.
+          const idPrefix =
+            (classNameCounts.get(className) ?? 1) > 1
+              ? `${className}~${occurrence}`
+              : className;
 
           classes.push({
             node,
@@ -318,7 +476,10 @@ function findLombokClasses(root: Parser.SyntaxNode): LombokClass[] {
             generateGetters: hasGetter,
             generateSetters: hasSetter,
             fields,
-            existingMethods,
+            existingMethods: collectExistingMethodArityMap(body ?? null),
+            getterAccess,
+            setterAccess,
+            idPrefix,
           });
         }
       }
@@ -367,19 +528,29 @@ export function synthesizeLombokAccessors(
     const ownerId = classOwnersById.get(cls.node.id);
     if (!ownerId) continue; // Class not in the graph — skip
 
-    // Synthesized method ids are keyed by the class's own simple name only
-    // (`Inner.method`), matching how real member ids are keyed for nested
-    // classes — `findEnclosingClassInfo().className` is the IMMEDIATE parent
-    // simple name, so a real method in `Outer.Inner` keys as `Inner.method`,
-    // never `Outer.Inner.method` (Java has no qualifiedNodeId).
-    const idMethodNamePrefix = cls.name;
+    // Synthesized method ids keep the REAL nested-member id shape
+    // (`Inner.method`, matching findEnclosingClassInfo for languages without
+    // `qualifiedNodeId` — Java among them) so call resolution can hit the
+    // synthetic method. Collision-freedom (review P1) is achieved WITHOUT
+    // breaking that shape: when two same-named classes share a file (which
+    // only nested classes can do in Java), a `~N` occurrence index keeps
+    // their synthetic ids distinct; a lone class keeps the plain name so
+    // the common case stays byte-identical to real member ids.
+    const idMethodNamePrefix = cls.idPrefix;
 
     for (const field of cls.fields) {
-      // Getter (skip if suppressed by @Getter(AccessLevel.NONE))
-      if (cls.generateGetters && !field.suppressGetter) {
+      // Getter: class default on, or field-level opt-in (review P1); suppressed
+      // by field-level NONE; collides only with a same-name SAME-ARITY (0)
+      // hand-written method (review P2 — overloads with args may coexist).
+      const getterOn = (cls.generateGetters || field.enableGetter) && !field.suppressGetter;
+      if (getterOn) {
         const gName = getterName(field.name, field.type);
-        if (!cls.existingMethods.has(gName)) {
+        if (!hasMethodWithArity(cls.existingMethods, gName, 0)) {
           const nodeId = `Method:${filePath}:${idMethodNamePrefix}.${gName}#0`;
+          // Lombok AccessLevel → graph visibility. PACKAGE/MODULE have no
+          // Java keyword form that fits `visibility`; keep the enum name so
+          // callers can see the real level (review P2).
+          const gVis = accessLevelToVisibility(field.getterAccess);
           result.nodes.push({
             id: nodeId,
             label: 'Method',
@@ -391,7 +562,7 @@ export function synthesizeLombokAccessors(
               language: 'java',
               isExported: false,
               synthetic: 'lombok',
-              visibility: 'public',
+              visibility: gVis,
               isStatic: false,
               returnType: field.type,
               parameterTypes: [],
@@ -408,7 +579,7 @@ export function synthesizeLombokAccessors(
             requiredParameterCount: 0,
             parameterTypes: [],
             returnType: field.type,
-            visibility: 'public',
+            visibility: gVis,
             isStatic: false,
             isAbstract: false,
             isFinal: false,
@@ -425,12 +596,15 @@ export function synthesizeLombokAccessors(
         }
       }
 
-      // Setter — skipped when suppressed by @Setter(AccessLevel.NONE) or when
-      // the field is final (Lombok never generates setters for final fields).
-      if (cls.generateSetters && !field.suppressSetter && !field.isFinal) {
+      // Setter — class default on, or field-level opt-in; suppressed by
+      // field-level NONE; final fields never get setters; collides only with
+      // a same-name SAME-ARITY (1) hand-written setter.
+      const setterOn = (cls.generateSetters || field.enableSetter) && !field.suppressSetter && !field.isFinal;
+      if (setterOn) {
         const sName = setterName(field.name);
-        if (!cls.existingMethods.has(sName)) {
+        if (!hasMethodWithArity(cls.existingMethods, sName, 1)) {
           const nodeId = `Method:${filePath}:${idMethodNamePrefix}.${sName}#1`;
+          const sVis = accessLevelToVisibility(field.setterAccess);
           result.nodes.push({
             id: nodeId,
             label: 'Method',
@@ -442,7 +616,7 @@ export function synthesizeLombokAccessors(
               language: 'java',
               isExported: false,
               synthetic: 'lombok',
-              visibility: 'public',
+              visibility: sVis,
               isStatic: false,
               returnType: 'void',
               parameterTypes: [field.type],
@@ -459,7 +633,7 @@ export function synthesizeLombokAccessors(
             requiredParameterCount: 1,
             parameterTypes: [field.type],
             returnType: 'void',
-            visibility: 'public',
+            visibility: sVis,
             isStatic: false,
             isAbstract: false,
             isFinal: false,
